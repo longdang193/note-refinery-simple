@@ -1,0 +1,10 @@
+provider: opencode
+
+models:
+  review: deepseek-v4-pro
+  patch: deepseek-v4-pro
+  verify: deepseek-v4-pro
+  image: minimax-m3
+
+patch_mode: clean-teaching
+timeout_seconds: 300

@@ -1,0 +1,1 @@
+"""Simple note refinery package."""
