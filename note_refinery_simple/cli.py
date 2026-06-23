@@ -9,6 +9,10 @@ from note_refinery_simple.llm import LLMConfig, OpenAICompatibleClient
 from note_refinery_simple.pipeline import PipelinePaths, ReviewPipeline
 
 
+def print_progress(message: str) -> None:
+    print(message, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Review, patch, and verify markdown class notes.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -69,7 +73,12 @@ def main() -> int:
         timeout_seconds=runtime_settings.timeout_seconds,
     )
     client = OpenAICompatibleClient(config)
-    pipeline = ReviewPipeline(client, image_enricher=client, patch_mode=runtime_settings.patch_mode)
+    pipeline = ReviewPipeline(
+        client,
+        image_enricher=client,
+        patch_mode=runtime_settings.patch_mode,
+        progress_callback=print_progress,
+    )
     paths = PipelinePaths.for_root(args.output_root)
 
     if args.command == "run":

@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 from note_refinery_simple.llm import extract_json_object_text
 
@@ -17,6 +17,9 @@ class LLMClient(Protocol):
 
 class ImageEnricher(Protocol):
     def describe_image(self, *, image_path: Path, markdown_file: str, nearby_heading: str | None) -> dict[str, object]: ...
+
+
+ProgressCallback = Callable[[str], None]
 
 
 IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
@@ -61,10 +64,12 @@ class ReviewPipeline:
         client: LLMClient,
         image_enricher: ImageEnricher | None = None,
         patch_mode: PatchMode = "clean-teaching",
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self._client = client
         self._image_enricher = image_enricher
         self._patch_mode = patch_mode
+        self._progress_callback = progress_callback
 
     def run(self, notes_dir: Path, paths: PipelinePaths) -> None:
         self.write_review(notes_dir=notes_dir, paths=paths)
@@ -74,21 +79,29 @@ class ReviewPipeline:
     def write_review(self, notes_dir: Path, paths: PipelinePaths) -> Path:
         paths.ensure()
         notes = read_notes(notes_dir)
-        image_contexts = build_image_contexts(notes_dir=notes_dir, image_enricher=self._image_enricher)
+        self._report_progress(f"review: loaded {len(notes)} markdown file(s)")
+        image_contexts = build_image_contexts(
+            notes_dir=notes_dir,
+            image_enricher=self._image_enricher,
+            progress_callback=self._progress_callback,
+        )
         if image_contexts:
             (paths.reports_dir / "image_context.json").write_text(
                 json.dumps(image_contexts, indent=2) + "\n",
                 encoding="utf-8",
             )
         prompt = build_review_prompt(notes, image_contexts=image_contexts)
+        self._report_progress("review: sending notes to reviewer")
         content = self._client.run_agent("reviewer", prompt)
         target = paths.reports_dir / "REVIEW.md"
         target.write_text(ensure_trailing_newline(content), encoding="utf-8")
+        self._report_progress("review: wrote REVIEW.md")
         return target
 
     def write_patched_notes(self, notes_dir: Path, paths: PipelinePaths) -> None:
         paths.ensure()
         notes = read_notes(notes_dir)
+        self._report_progress(f"patch: loaded {len(notes)} markdown file(s)")
         review = (paths.reports_dir / "REVIEW.md").read_text(encoding="utf-8")
         image_contexts = load_image_contexts(paths.reports_dir / "image_context.json")
         payload = self._collect_patched_files(
@@ -103,6 +116,7 @@ class ReviewPipeline:
             target = paths.patched_notes_dir / note_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(ensure_trailing_newline(clean_patched_markdown(patched_content)), encoding="utf-8")
+        self._report_progress(f"patch: wrote {len(notes)} patched file(s)")
 
     def _collect_patched_files(
         self,
@@ -116,10 +130,12 @@ class ReviewPipeline:
             image_contexts=image_contexts,
             patch_mode=self._patch_mode,
         )
+        self._report_progress("patch: sending notes to patcher")
         payload = parse_patch_payload(self._client.run_agent("patcher", prompt))
         missing_notes = {name: content for name, content in notes.items() if name not in payload}
         if not missing_notes:
             return payload
+        self._report_progress(f"patch: retrying {len(missing_notes)} missing file(s)")
         retry_prompt = build_missing_patch_prompt(
             missing_notes=missing_notes,
             review_markdown=review_markdown,
@@ -138,10 +154,17 @@ class ReviewPipeline:
             review_markdown=(paths.reports_dir / "REVIEW.md").read_text(encoding="utf-8"),
             image_contexts=load_image_contexts(paths.reports_dir / "image_context.json"),
         )
+        self._report_progress("verify: sending notes to verifier")
         content = self._client.run_agent("verifier", prompt)
         target = paths.reports_dir / "VERIFY.md"
         target.write_text(ensure_trailing_newline(content), encoding="utf-8")
+        self._report_progress("verify: wrote VERIFY.md")
         return target
+
+    def _report_progress(self, message: str) -> None:
+        if self._progress_callback is None:
+            return
+        self._progress_callback(message)
 
 
 def read_notes(notes_dir: Path) -> dict[str, str]:
@@ -259,11 +282,22 @@ def collect_image_tasks(notes_dir: Path) -> list[ImageTask]:
     return tasks
 
 
-def build_image_contexts(notes_dir: Path, image_enricher: ImageEnricher | None) -> list[dict[str, object]]:
+def build_image_contexts(
+    notes_dir: Path,
+    image_enricher: ImageEnricher | None,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, object]]:
     if image_enricher is None:
         return []
+    tasks = collect_image_tasks(notes_dir)
+    if progress_callback is not None and tasks:
+        progress_callback(f"review: enriching {len(tasks)} image(s)")
     contexts: list[dict[str, object]] = []
-    for task in collect_image_tasks(notes_dir):
+    for index, task in enumerate(tasks, start=1):
+        if progress_callback is not None:
+            progress_callback(
+                f"review: image {index}/{len(tasks)} -> {task.markdown_file} ({task.image_markdown_path})"
+            )
         payload = image_enricher.describe_image(
             image_path=task.image_path,
             markdown_file=task.markdown_file,

@@ -42,6 +42,57 @@ class FakeImageEnricher:
 
 
 class ReviewPipelineTest(unittest.TestCase):
+    def test_run_reports_stage_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+            (notes_dir / "queueing.md").write_text("# Queueing\n\nW = L", encoding="utf-8")
+
+            messages: list[str] = []
+            client = FakeLLMClient(
+                [
+                    "# Review\n\n- Fix Little's Law context.",
+                    json.dumps({"files": {"queueing.md": "# Queueing\n\nW = L / lambda"}}),
+                    "# Verify\n\n- All requested fixes present.",
+                ]
+            )
+            pipeline = ReviewPipeline(client, progress_callback=messages.append)
+            paths = PipelinePaths.for_root(root)
+
+            pipeline.run(notes_dir=notes_dir, paths=paths)
+
+            self.assertIn("review: loaded 1 markdown file(s)", messages)
+            self.assertIn("review: sending notes to reviewer", messages)
+            self.assertIn("review: wrote REVIEW.md", messages)
+            self.assertIn("patch: loaded 1 markdown file(s)", messages)
+            self.assertIn("patch: sending notes to patcher", messages)
+            self.assertIn("patch: wrote 1 patched file(s)", messages)
+            self.assertIn("verify: sending notes to verifier", messages)
+            self.assertIn("verify: wrote VERIFY.md", messages)
+
+    def test_review_reports_image_enrichment_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            images_dir = notes_dir / "images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "chart.jpg").write_bytes(b"fake-jpg")
+            (notes_dir / "full.md").write_text(
+                "# Parallel movement\n\n![](images/chart.jpg)\n",
+                encoding="utf-8",
+            )
+
+            messages: list[str] = []
+            client = FakeLLMClient(["# Review\n\n- Cross-check chart with text."])
+            pipeline = ReviewPipeline(client, image_enricher=FakeImageEnricher(), progress_callback=messages.append)
+            paths = PipelinePaths.for_root(root)
+
+            pipeline.write_review(notes_dir=notes_dir, paths=paths)
+
+            self.assertIn("review: enriching 1 image(s)", messages)
+            self.assertIn("review: image 1/1 -> full.md (images/chart.jpg)", messages)
+
     def test_collect_image_tasks_finds_local_markdown_images(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

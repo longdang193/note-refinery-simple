@@ -101,6 +101,16 @@ patched_notes/*.md
 
 If you use `run`, all stages execute automatically.
 
+Commands now print live progress so you can see stage activity during long runs, for example:
+
+```text
+review: loaded 12 markdown file(s)
+review: enriching 34 image(s)
+review: image 1/34 -> full.md (images/page-01.jpg)
+patch: sending notes to patcher
+verify: wrote VERIFY.md
+```
+
 Patch mode defaults to `clean-teaching`, which rewrites noisy OCR into distilled study notes. Use `--mode conservative` if you want lighter edits that stay closer to the source layout.
 
 The tool loads `.env` from its own project directory if present.
