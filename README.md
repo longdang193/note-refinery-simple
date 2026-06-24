@@ -1,29 +1,31 @@
 # note-refinery-simple
 
-Small Python CLI for three LLM agents over Markdown class notes:
+Small Python CLI for LLM-based note cleanup.
 
-1. reviewer writes `reports/REVIEW.md`
-2. patcher writes corrected files to `patched_notes/`
-3. verifier writes `reports/VERIFY.md`
-4. synthesizer writes `reports/SYNTHESIS.md` and `reports/concept_map.json`
+Pipeline:
+
+1. `review` writes `reports/REVIEW.md` and canonical `reports/image_context.json`
+2. `patch` writes cleaned files to `patched_notes/`
+3. `verify` writes `reports/VERIFY.md`
+4. `synthesize` writes `reports/SYNTHESIS.md` and `reports/concept_map.json`
 
 It uses any OpenAI-compatible endpoint, including Opencode and DeepSeek.
 
-Prompt text is centralized in Markdown files under `prompts/`, so you can tune prompt versions without editing Python code.
+Prompt text lives in Markdown files under `prompts/`, so you can tune prompt versions without editing Python code.
 
 ## Requirements
 
 - Python 3.11+
 - `.env` for API key
-- `note_refinery.yaml` for provider, models, prompt profile, patch mode, and timeout
+- `note_refinery.yaml` for provider, models, prompt profile, patch mode, patch concurrency, and timeout
 
 ## Project layout
 
 ```text
 note-refinery-simple/
   note_refinery_simple/
+  prompts/
   tests/
-  pyproject.toml
   .env.example
   note_refinery.yaml.example
   README.md
@@ -55,6 +57,7 @@ prompts:
   root_dir: prompts
 
 patch_mode: clean-teaching
+patch_concurrency: 3
 timeout_seconds: 300
 ```
 
@@ -74,25 +77,11 @@ models:
 prompts:
   profile: default
   root_dir: prompts
+
+patch_mode: clean-teaching
+patch_concurrency: 3
+timeout_seconds: 300
 ```
-
-Prompt layout:
-
-```text
-prompts/
-  base/
-    system.md
-    image_system.md
-  profiles/
-    default/
-      review.md
-      patch.md
-      verify.md
-      synthesize.md
-      image_user.md
-```
-
-You can create another profile such as `prompts/profiles/strict/` and switch to it with config or CLI.
 
 Secrets stay in `.env`:
 
@@ -107,9 +96,13 @@ Pipeline overview:
 1. `review`
    - reads markdown notes
    - writes `reports/REVIEW.md`
+   - writes canonical `reports/image_context.json` for image enrichment context
+   - persists `image_context.json` incrementally after each image so partial progress survives aborts and reruns
    - finds formula issues, notation problems, missing assumptions, contradictions, and cross-file inconsistencies
 2. `patch`
    - reads original notes and `reports/REVIEW.md`
+   - patches each markdown file in its own LLM call
+   - uses topic guard before accepting each patched file
    - writes cleaned notes into `patched_notes/`
 3. `verify`
    - checks whether patched notes resolved review findings
@@ -118,15 +111,9 @@ Pipeline overview:
    - reads all patched notes together
    - writes `reports/SYNTHESIS.md`
    - writes `reports/concept_map.json`
-   - makes cross-file relationships, prerequisites, and unified definitions explicit
 5. `run`
-   - runs `review -> patch -> verify -> synthesize` in one command
-
-From this folder:
-
-```bash
-py -3 -m note_refinery_simple run --notes-dir notes --output-root .
-```
+   - runs `review -> patch -> verify -> synthesize`
+   - if `VERIFY.md` flags specific files, only those files are repatched and re-verified before synthesis
 
 Outputs:
 
@@ -135,23 +122,26 @@ reports/REVIEW.md
 reports/VERIFY.md
 reports/SYNTHESIS.md
 reports/concept_map.json
+reports/image_context.json
 patched_notes/*.md
 ```
 
-If you use `run`, all stages execute automatically.
-
-Commands now print live progress so you can see stage activity during long runs, for example:
+Commands print live progress, for example:
 
 ```text
 review: loaded 12 markdown file(s)
 review: enriching 34 image(s)
 review: image 1/34 -> full.md (images/page-01.jpg)
-patch: sending notes to patcher
+patch: file 1/12 -> ACT2026_1_Introduction/full.md
+patch: topic guard failed -> ACT2026_2_Optimization/full.md
+patch: retry 2/3 -> ACT2026_2_Optimization/full.md
 verify: wrote VERIFY.md
 synthesize: wrote SYNTHESIS.md and concept_map.json
 ```
 
 Patch mode defaults to `clean-teaching`, which rewrites noisy OCR into distilled study notes. Use `--mode conservative` if you want lighter edits that stay closer to the source layout.
+
+Patch execution defaults to `patch_concurrency: 3`. Increase it only if your provider handles parallel requests cleanly.
 
 The tool loads `.env` from its own project directory if present.
 
@@ -159,19 +149,7 @@ If `note_refinery.yaml` exists in project root, it is loaded automatically. You 
 
 Useful CLI commands:
 
-Single markdown file:
-
-```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\path\to\one-note-folder" --output-root ".\out"
-```
-
-Batch process folder of markdown notes:
-
-```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\path\to\notes-folder" --output-root ".\out"
-```
-
-Run on your `MinerU` folder:
+Run whole pipeline:
 
 ```powershell
 py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run"
@@ -181,6 +159,12 @@ Keep edits closer to source layout:
 
 ```powershell
 py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run-conservative" --mode conservative
+```
+
+Set patch concurrency temporarily:
+
+```powershell
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --patch-concurrency 4
 ```
 
 Use another config file:
@@ -201,18 +185,29 @@ Try another prompt profile temporarily:
 py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --prompt-profile strict
 ```
 
-You can also run stages one by one:
+Run stages one by one:
 
-```bash
+```powershell
 py -3 -m note_refinery_simple review --notes-dir notes --output-root .
 py -3 -m note_refinery_simple patch --notes-dir notes --output-root . --mode clean-teaching
 py -3 -m note_refinery_simple verify --notes-dir notes --output-root .
 py -3 -m note_refinery_simple synthesize --notes-dir notes --output-root .
 ```
 
+Fast rerun with cached artifacts:
+
+`--reuse-image-context-from` can point at full or partial `reports/image_context.json`. Missing images are enriched live, then merged back into canonical cache file for current run.
+
+
+```powershell
+py -3 -m note_refinery_simple review --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\rerun-review" --reuse-image-context-from ".\live-run"
+py -3 -m note_refinery_simple patch --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\rerun-patch" --reuse-review-from ".\live-run" --reuse-image-context-from ".\live-run"
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\rerun-full" --reuse-review-from ".\live-run" --reuse-image-context-from ".\live-run"
+```
+
 Stage notes:
 
-- `review` only creates `reports/REVIEW.md`
+- `review` creates `reports/REVIEW.md` and canonical `reports/image_context.json`
 - `patch` expects `reports/REVIEW.md` to already exist
 - `verify` expects patched notes in `patched_notes/` and checks them against `REVIEW.md`
 - `synthesize` expects patched notes in `patched_notes/` and `VERIFY.md` in `reports/`
@@ -226,8 +221,7 @@ Stage notes:
 
 ## Tests
 
-From this folder:
-
 ```powershell
 py -3 -m unittest discover -s tests -t . -v
+python -m mypy note_refinery_simple tests
 ```

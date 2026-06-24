@@ -10,6 +10,7 @@ PatchMode = Literal["clean-teaching", "conservative"]
 
 DEFAULT_PROVIDER = "opencode"
 DEFAULT_TIMEOUT_SECONDS = 180
+DEFAULT_PATCH_CONCURRENCY = 3
 DEFAULT_CONFIG_FILE_NAME = "note_refinery.yaml"
 PROVIDER_BASE_URLS = {
     "opencode": "https://opencode.ai/zen/go/v1",
@@ -29,6 +30,7 @@ class RuntimeSettings:
     prompt_profile: str
     prompt_root_dir: Path
     patch_mode: PatchMode
+    patch_concurrency: int
     timeout_seconds: int
     config_path: Path | None
 
@@ -69,6 +71,11 @@ def load_runtime_settings(
         file_config.get("patch_mode"),
         "clean-teaching",
     )
+    patch_concurrency_value = first_non_none(
+        cli_overrides.get("patch_concurrency"),
+        file_config.get("patch_concurrency"),
+        DEFAULT_PATCH_CONCURRENCY,
+    )
     timeout_value = first_non_none(
         cli_overrides.get("timeout_seconds"),
         file_config.get("timeout_seconds"),
@@ -92,7 +99,8 @@ def load_runtime_settings(
         prompt_profile=str(first_non_none(cli_overrides.get("prompt_profile"), prompt_config.get("profile"), DEFAULT_PROMPT_PROFILE)),
         prompt_root_dir=resolve_prompt_root_dir(cli_overrides.get("prompt_root_dir"), prompt_config.get("root_dir")),
         patch_mode=normalize_patch_mode(str(patch_mode_value)),
-        timeout_seconds=parse_timeout_seconds(timeout_value),
+        patch_concurrency=parse_positive_int(patch_concurrency_value, field_name="patch_concurrency"),
+        timeout_seconds=parse_positive_int(timeout_value, field_name="timeout_seconds"),
         config_path=config_path,
     )
 
@@ -203,12 +211,15 @@ def normalize_patch_mode(value: str) -> PatchMode:
     return cast(PatchMode, value)
 
 
-def parse_timeout_seconds(value: object | None) -> int:
+def parse_positive_int(value: object | None, *, field_name: str) -> int:
     if value is None:
-        return DEFAULT_TIMEOUT_SECONDS
-    if isinstance(value, (int, str)):
-        return int(value)
-    raise ValueError(f"Unsupported timeout_seconds value: {value!r}")
+        raise ValueError(f"Unsupported {field_name} value: {value!r}")
+    if not isinstance(value, (int, str)):
+        raise ValueError(f"Unsupported {field_name} value: {value!r}")
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{field_name} must be >= 1")
+    return parsed
 
 
 def as_optional_str(value: object) -> str | None:

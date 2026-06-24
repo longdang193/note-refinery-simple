@@ -42,6 +42,40 @@ class CliParserTest(unittest.TestCase):
 
             self.assertEqual(args.mode, "conservative")
 
+    def test_parser_accepts_cached_rerun_flags(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+            cache_root = root / "cache"
+            cache_root.mkdir()
+
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--notes-dir",
+                    str(notes_dir),
+                    "--reuse-review-from",
+                    str(cache_root),
+                    "--reuse-image-context-from",
+                    str(cache_root),
+                ]
+            )
+
+            self.assertEqual(args.reuse_review_from, cache_root)
+            self.assertEqual(args.reuse_image_context_from, cache_root)
+    def test_parser_accepts_patch_concurrency(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+
+            args = parser.parse_args(["run", "--notes-dir", str(notes_dir), "--patch-concurrency", "4"])
+
+            self.assertEqual(args.patch_concurrency, 4)
+
     def test_parser_accepts_config_path(self) -> None:
         parser = build_parser()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -114,3 +148,4 @@ class CliParserTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

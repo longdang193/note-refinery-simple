@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from json import JSONDecodeError
 from pathlib import Path
@@ -23,7 +25,6 @@ class ImageEnricher(Protocol):
 
 ProgressCallback = Callable[[str], None]
 
-
 IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*)$")
 HEADER_FOOTER_PATTERN = re.compile(
@@ -31,7 +32,27 @@ HEADER_FOOTER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 STANDALONE_NOISE_PATTERN = re.compile(r"^(Inventory|Formulary)$", re.IGNORECASE)
-MAX_PATCH_RETRY_ROUNDS = 3
+TOKEN_PATTERN = re.compile(r"[A-Za-z]{3,}")
+TOPIC_STOPWORDS = {
+    "full",
+    "note",
+    "notes",
+    "lecture",
+    "lectures",
+    "chapter",
+    "section",
+    "page",
+    "pages",
+    "pdf",
+    "production",
+    "planning",
+    "scheduling",
+    "guericke",
+    "von",
+}
+DEFAULT_PATCH_CONCURRENCY = 3
+MAX_PATCH_ATTEMPTS_PER_FILE = 3
+MAX_VERIFY_REPAIR_ROUNDS = 2
 
 
 @dataclass(frozen=True)
@@ -73,35 +94,78 @@ class ReviewPipeline:
         client: LLMClient,
         image_enricher: ImageEnricher | None = None,
         patch_mode: PatchMode = "clean-teaching",
+        patch_concurrency: int = DEFAULT_PATCH_CONCURRENCY,
         progress_callback: ProgressCallback | None = None,
         prompt_set: PromptSet | None = None,
     ) -> None:
         self._client = client
         self._image_enricher = image_enricher
         self._patch_mode = patch_mode
+        self._patch_concurrency = max(1, patch_concurrency)
         self._progress_callback = progress_callback
         self._prompt_set = prompt_set
 
-    def run(self, notes_dir: Path, paths: PipelinePaths) -> None:
-        self.write_review(notes_dir=notes_dir, paths=paths)
+    def run(
+        self,
+        notes_dir: Path,
+        paths: PipelinePaths,
+        reuse_review_markdown: str | None = None,
+        cached_image_contexts: list[dict[str, object]] | None = None,
+    ) -> None:
+        if reuse_review_markdown is not None:
+            paths.ensure()
+            (paths.reports_dir / "REVIEW.md").write_text(
+                ensure_trailing_newline(reuse_review_markdown),
+                encoding="utf-8",
+            )
+            if cached_image_contexts is not None:
+                write_json_file_atomic(paths.reports_dir / "image_context.json", cached_image_contexts)
+            self._report_progress("review: reused cached REVIEW.md")
+        else:
+            self.write_review(
+                notes_dir=notes_dir,
+                paths=paths,
+                cached_image_contexts=cached_image_contexts,
+            )
         self.write_patched_notes(notes_dir=notes_dir, paths=paths)
-        self.write_verify(notes_dir=notes_dir, paths=paths)
+        verify_path = self.write_verify(notes_dir=notes_dir, paths=paths)
+        note_names = set(read_notes(notes_dir))
+        repair_round = 0
+        flagged_files = extract_flagged_files_from_verify(verify_path.read_text(encoding="utf-8"), note_names)
+        while flagged_files and repair_round < MAX_VERIFY_REPAIR_ROUNDS:
+            repair_round += 1
+            self._report_progress(f"patch: repairing {len(flagged_files)} flagged file(s) after verify")
+            self.write_patched_notes(notes_dir=notes_dir, paths=paths, selected_note_names=flagged_files)
+            verify_path = self.write_verify(notes_dir=notes_dir, paths=paths)
+            flagged_files = extract_flagged_files_from_verify(verify_path.read_text(encoding="utf-8"), note_names)
         self.write_synthesis(notes_dir=notes_dir, paths=paths)
 
-    def write_review(self, notes_dir: Path, paths: PipelinePaths) -> Path:
+    def write_review(
+        self,
+        notes_dir: Path,
+        paths: PipelinePaths,
+        cached_image_contexts: list[dict[str, object]] | None = None,
+    ) -> Path:
         paths.ensure()
         notes = read_notes(notes_dir)
         self._report_progress(f"review: loaded {len(notes)} markdown file(s)")
-        image_contexts = build_image_contexts(
-            notes_dir=notes_dir,
-            image_enricher=self._image_enricher,
-            progress_callback=self._progress_callback,
-        )
-        if image_contexts:
-            (paths.reports_dir / "image_context.json").write_text(
-                json.dumps(image_contexts, indent=2) + "\n",
-                encoding="utf-8",
+        if cached_image_contexts is None:
+            image_contexts = build_image_contexts(
+                notes_dir=notes_dir,
+                image_enricher=self._image_enricher,
+                progress_callback=self._progress_callback,
+                image_context_path=paths.reports_dir / "image_context.json",
             )
+        else:
+            image_contexts = build_image_contexts(
+                notes_dir=notes_dir,
+                image_enricher=self._image_enricher,
+                progress_callback=self._progress_callback,
+                image_context_path=paths.reports_dir / "image_context.json",
+                cached_contexts=cached_image_contexts,
+            )
+        if image_contexts or cached_image_contexts is not None:
+            write_json_file_atomic(paths.reports_dir / "image_context.json", image_contexts)
         prompt = build_review_prompt(
             notes,
             image_contexts=image_contexts,
@@ -114,79 +178,82 @@ class ReviewPipeline:
         self._report_progress("review: wrote REVIEW.md")
         return target
 
-    def write_patched_notes(self, notes_dir: Path, paths: PipelinePaths) -> None:
+    def write_patched_notes(
+        self,
+        notes_dir: Path,
+        paths: PipelinePaths,
+        selected_note_names: set[str] | None = None,
+    ) -> None:
         paths.ensure()
         notes = read_notes(notes_dir)
+        if selected_note_names is not None:
+            notes = {name: content for name, content in notes.items() if name in selected_note_names}
         self._report_progress(f"patch: loaded {len(notes)} markdown file(s)")
-        review = (paths.reports_dir / "REVIEW.md").read_text(encoding="utf-8")
+        if not notes:
+            return
+        review_markdown = (paths.reports_dir / "REVIEW.md").read_text(encoding="utf-8")
         image_contexts = load_image_contexts(paths.reports_dir / "image_context.json")
-        payload = self._collect_patched_files(
-            notes=notes,
-            review_markdown=review,
-            image_contexts=image_contexts,
-        )
-        for note_path, note_content in notes.items():
-            patched_content = payload.get(note_path)
-            if patched_content is None:
-                raise ValueError(f"Missing patched content for {note_path}")
-            target = paths.patched_notes_dir / note_path
+        patched_notes = self._patch_notes(notes, review_markdown, image_contexts)
+        for note_name, patched_content in patched_notes.items():
+            target = paths.patched_notes_dir / note_name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(ensure_trailing_newline(clean_patched_markdown(patched_content)), encoding="utf-8")
         self._report_progress(f"patch: wrote {len(notes)} patched file(s)")
 
-    def _collect_patched_files(
+    def _patch_notes(
         self,
         notes: dict[str, str],
         review_markdown: str,
         image_contexts: list[dict[str, object]],
     ) -> dict[str, str]:
-        prompt = build_patch_prompt(
-            notes=notes,
-            review_markdown=review_markdown,
-            image_contexts=image_contexts,
-            patch_mode=self._patch_mode,
-            template=None if self._prompt_set is None else self._prompt_set.patch_prompt,
-        )
-        self._report_progress("patch: sending notes to patcher")
-        raw_patch_response = self._client.run_agent("patcher", prompt)
-        payload = self._parse_or_repair_patch_payload(raw_patch_response)
-        missing_notes = {name: content for name, content in notes.items() if name not in payload}
-        retry_round = 0
-        while missing_notes and retry_round < MAX_PATCH_RETRY_ROUNDS:
-            retry_round += 1
-            self._report_progress(f"patch: retrying {len(missing_notes)} missing file(s)")
-            existing_note_names = set(payload)
-            retry_prompt = build_missing_patch_prompt(
-                missing_notes=missing_notes,
+        patched_notes: dict[str, str] = {}
+        max_workers = min(self._patch_concurrency, len(notes))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            total = len(notes)
+            for index, (note_name, note_content) in enumerate(notes.items(), start=1):
+                self._report_progress(f"patch: file {index}/{total} -> {note_name}")
+                futures[
+                    executor.submit(
+                        self._patch_one_note_with_retries,
+                        note_name,
+                        note_content,
+                        review_markdown,
+                        filter_image_contexts(image_contexts, note_name),
+                    )
+                ] = note_name
+            for future in as_completed(futures):
+                note_name = futures[future]
+                patched_notes[note_name] = future.result()
+        return patched_notes
+
+    def _patch_one_note_with_retries(
+        self,
+        note_name: str,
+        note_content: str,
+        review_markdown: str,
+        image_contexts: list[dict[str, object]],
+    ) -> str:
+        for attempt in range(1, MAX_PATCH_ATTEMPTS_PER_FILE + 1):
+            if attempt > 1:
+                self._report_progress(f"patch: retry {attempt}/{MAX_PATCH_ATTEMPTS_PER_FILE} -> {note_name}")
+            prompt = build_patch_prompt(
+                notes={note_name: note_content},
                 review_markdown=review_markdown,
                 image_contexts=image_contexts,
                 patch_mode=self._patch_mode,
                 template=None if self._prompt_set is None else self._prompt_set.patch_prompt,
             )
-            raw_retry_response = self._client.run_agent("patcher", retry_prompt)
-            retry_payload = self._parse_or_repair_patch_payload(raw_retry_response)
-            payload.update(retry_payload)
-            if set(payload) == existing_note_names:
-                self._report_progress("patch: retry made no progress; stopping early")
-                break
-            missing_notes = {name: content for name, content in notes.items() if name not in payload}
-        missing_notes = {name: content for name, content in notes.items() if name not in payload}
-        if missing_notes:
-            self._report_progress(f"patch: falling back to single-file patching for {len(missing_notes)} file(s)")
-        for note_name, note_content in missing_notes.items():
-            self._report_progress(f"patch: single-file fallback -> {note_name}")
-            fallback_prompt = build_missing_patch_prompt(
-                missing_notes={note_name: note_content},
-                review_markdown=review_markdown,
-                image_contexts=image_contexts,
-                patch_mode=self._patch_mode,
-                template=None if self._prompt_set is None else self._prompt_set.patch_prompt,
-            )
-            fallback_payload = self._parse_or_repair_patch_payload(
-                self._client.run_agent("patcher", fallback_prompt)
-            )
-            payload.update(fallback_payload)
-        return payload
+            payload = self._parse_or_repair_patch_payload(self._client.run_agent("patcher", prompt))
+            patched_payload = remap_single_file_payload(note_name, payload)
+            patched_content = patched_payload.get(note_name)
+            if patched_content is None:
+                continue
+            if not topic_guard_passes(note_name, note_content, patched_content):
+                self._report_progress(f"patch: topic guard failed -> {note_name}")
+                continue
+            return patched_content
+        raise ValueError(f"Missing patched content for {note_name}")
 
     def _parse_or_repair_patch_payload(self, content: str) -> dict[str, str]:
         try:
@@ -195,6 +262,14 @@ class ReviewPipeline:
             repair_prompt = build_patch_repair_prompt(content)
             repaired_content = self._client.run_agent("patcher", repair_prompt)
             return parse_patch_payload(repaired_content)
+
+    def _parse_or_repair_synthesis_payload(self, content: str) -> SynthesisPayload:
+        try:
+            return parse_synthesis_payload(content)
+        except (JSONDecodeError, ValueError):
+            repair_prompt = build_synthesis_repair_prompt(content)
+            repaired_content = self._client.run_agent("synthesizer", repair_prompt)
+            return parse_synthesis_payload(repaired_content)
 
     def write_verify(self, notes_dir: Path, paths: PipelinePaths) -> Path:
         paths.ensure()
@@ -223,13 +298,10 @@ class ReviewPipeline:
             template=None if self._prompt_set is None else self._prompt_set.synthesize_prompt,
         )
         self._report_progress("synthesize: sending patched notes to synthesizer")
-        payload = parse_synthesis_payload(self._client.run_agent("synthesizer", prompt))
+        payload = self._parse_or_repair_synthesis_payload(self._client.run_agent("synthesizer", prompt))
         target = paths.reports_dir / "SYNTHESIS.md"
         target.write_text(ensure_trailing_newline(payload.synthesis_markdown), encoding="utf-8")
-        (paths.reports_dir / "concept_map.json").write_text(
-            json.dumps(payload.concept_map, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_json_file_atomic(paths.reports_dir / "concept_map.json", payload.concept_map)
         self._report_progress("synthesize: wrote SYNTHESIS.md and concept_map.json")
         return target
 
@@ -256,12 +328,41 @@ def ensure_trailing_newline(content: str) -> str:
     return content.rstrip() + "\n"
 
 
+def write_json_file_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.stem + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+        temp_path = Path(handle.name)
+    temp_path.replace(path)
+
+
+def image_context_key(markdown_file: object, image_path: object) -> tuple[str, str] | None:
+    if not isinstance(markdown_file, str) or not isinstance(image_path, str):
+        return None
+    return markdown_file, image_path
+
+
 def parse_patch_payload(content: str) -> dict[str, str]:
     payload = json.loads(extract_first_json_object(content))
     files = payload.get("files")
     if not isinstance(files, dict):
         raise ValueError("Patcher must return JSON object with top-level 'files' mapping")
     return {str(name): str(text) for name, text in files.items()}
+
+
+def remap_single_file_payload(requested_note_name: str, payload: dict[str, str]) -> dict[str, str]:
+    if requested_note_name in payload or len(payload) != 1:
+        return payload
+    only_content = next(iter(payload.values()))
+    return {requested_note_name: only_content}
 
 
 def parse_synthesis_payload(content: str) -> SynthesisPayload:
@@ -432,32 +533,63 @@ def build_image_contexts(
     notes_dir: Path,
     image_enricher: ImageEnricher | None,
     progress_callback: ProgressCallback | None = None,
+    image_context_path: Path | None = None,
+    cached_contexts: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
-    if image_enricher is None:
-        return []
     tasks = collect_image_tasks(notes_dir)
+    contexts: list[dict[str, object]] = []
+    cached_keys: set[tuple[str, str]] = set()
+    if cached_contexts is not None:
+        for context in cached_contexts:
+            key = image_context_key(context.get("markdown_file"), context.get("image_path"))
+            if key is None or key in cached_keys:
+                continue
+            contexts.append(context)
+            cached_keys.add(key)
+        if progress_callback is not None and contexts:
+            progress_callback(f"review: reused cached image context for {len(contexts)} image(s)")
+        if image_context_path is not None and contexts:
+            write_json_file_atomic(image_context_path, contexts)
+    if image_enricher is None:
+        return contexts
     if progress_callback is not None and tasks:
         progress_callback(f"review: enriching {len(tasks)} image(s)")
-    contexts: list[dict[str, object]] = []
     for index, task in enumerate(tasks, start=1):
+        if (task.markdown_file, task.image_markdown_path) in cached_keys:
+            continue
         if progress_callback is not None:
             progress_callback(
                 f"review: image {index}/{len(tasks)} -> {task.markdown_file} ({task.image_markdown_path})"
             )
-        payload = image_enricher.describe_image(
-            image_path=task.image_path,
-            markdown_file=task.markdown_file,
-            nearby_heading=task.nearby_heading,
+        try:
+            payload = image_enricher.describe_image(
+                image_path=task.image_path,
+                markdown_file=task.markdown_file,
+                nearby_heading=task.nearby_heading,
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("Image enricher must return a dictionary payload")
+        except Exception as error:
+            if progress_callback is not None:
+                progress_callback(f"review: image fallback -> {task.markdown_file} ({task.image_markdown_path})")
+            payload = {
+                "detected_type": "unknown",
+                "summary": "Image enrichment failed.",
+                "visible_text": [],
+                "chart_structure": {},
+                "possible_risks": [f"Image enrichment failed: {error}"],
+                "confidence": "low",
+            }
+        contexts.append(
+            {
+                **payload,
+                "image_path": task.image_markdown_path,
+                "markdown_file": task.markdown_file,
+                "nearby_heading": task.nearby_heading,
+            }
         )
-        if not isinstance(payload, dict):
-            raise ValueError("Image enricher must return a dictionary payload")
-        context = {
-            "image_path": task.image_markdown_path,
-            "markdown_file": task.markdown_file,
-            "nearby_heading": task.nearby_heading,
-            **payload,
-        }
-        contexts.append(context)
+        if image_context_path is not None:
+            write_json_file_atomic(image_context_path, contexts)
     return contexts
 
 
@@ -502,6 +634,10 @@ def render_patch_image_contexts(image_contexts: list[dict[str, object]]) -> str:
     return "\n\nPATCH_IMAGE_CONTEXTS\n" + "\n\n".join(blocks)
 
 
+def filter_image_contexts(image_contexts: list[dict[str, object]], note_name: str) -> list[dict[str, object]]:
+    return [context for context in image_contexts if context.get("markdown_file") == note_name]
+
+
 def load_image_contexts(image_context_path: Path) -> list[dict[str, object]]:
     if not image_context_path.exists():
         return []
@@ -511,30 +647,21 @@ def load_image_contexts(image_context_path: Path) -> list[dict[str, object]]:
     return [context for context in payload if isinstance(context, dict)]
 
 
-def build_missing_patch_prompt(
-    missing_notes: dict[str, str],
-    review_markdown: str,
-    image_contexts: list[dict[str, object]] | None = None,
-    patch_mode: PatchMode = "clean-teaching",
-    template: str | None = None,
-) -> str:
-    return (
-        build_patch_prompt(
-            notes=missing_notes,
-            review_markdown=review_markdown,
-            image_contexts=image_contexts,
-            patch_mode=patch_mode,
-            template=template,
-        )
-        + "\n\nThe previous patch response omitted these missing files. Return JSON for every missing file only."
-    )
-
-
 def build_patch_repair_prompt(invalid_response: str) -> str:
     return (
         "Repair malformed patcher output into valid JSON only.\n"
         "Do not change note content beyond escaping and JSON repair.\n"
         "Return exactly one JSON object with shape: {\"files\": {\"relative/path.md\": \"full patched content\"}}.\n"
+        "Do not add markdown fences, commentary, or extra keys.\n\n"
+        f"MALFORMED_RESPONSE\n{invalid_response}"
+    )
+
+
+def build_synthesis_repair_prompt(invalid_response: str) -> str:
+    return (
+        "Repair malformed synthesizer output into valid JSON only.\n"
+        "Do not change synthesis meaning beyond escaping and JSON repair.\n"
+        "Return exactly one JSON object with shape: {\"synthesis_markdown\": \"full markdown\", \"concept_map\": {\"concepts\": [], \"relationships\": []}}.\n"
         "Do not add markdown fences, commentary, or extra keys.\n\n"
         f"MALFORMED_RESPONSE\n{invalid_response}"
     )
@@ -592,11 +719,46 @@ def clean_patched_markdown(content: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def topic_guard_passes(note_name: str, original_content: str, patched_content: str) -> bool:
+    source_tokens = extract_topic_tokens(note_name) | extract_topic_tokens(extract_heading_and_preview(original_content))
+    if not source_tokens:
+        return True
+    patched_tokens = extract_topic_tokens(extract_heading_and_preview(patched_content))
+    return bool(source_tokens & patched_tokens)
+
+
+def extract_heading_and_preview(content: str) -> str:
+    lines = content.splitlines()[:20]
+    return "\n".join(lines)
+
+
+def extract_topic_tokens(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in TOKEN_PATTERN.findall(text.replace("_", " ").replace("/", " "))
+        if token.lower() not in TOPIC_STOPWORDS
+    }
+
+
+def extract_flagged_files_from_verify(verify_markdown: str, note_names: set[str]) -> set[str]:
+    section_match = re.search(
+        r"^## Possible Regressions\s*(.*?)(?:^## |\Z)",
+        verify_markdown,
+        re.MULTILINE | re.DOTALL,
+    )
+    if section_match is None:
+        return set()
+    section_text = section_match.group(1)
+    return {
+        match
+        for match in re.findall(r"`([^`]+\.md)`", section_text)
+        if match in note_names
+    }
+
+
 def extract_first_json_object(content: str) -> str:
     stripped = extract_json_object_text(content)
     decoder = json.JSONDecoder()
     payload, _ = decoder.raw_decode(stripped)
     return json.dumps(payload)
-
-
 

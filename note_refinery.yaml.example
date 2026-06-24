@@ -12,4 +12,5 @@ prompts:
   root_dir: prompts
 
 patch_mode: clean-teaching
+patch_concurrency: 3
 timeout_seconds: 300

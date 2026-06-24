@@ -23,6 +23,7 @@ class RuntimeConfigTest(unittest.TestCase):
                 "  profile: strict\n"
                 "  root_dir: custom-prompts\n"
                 "patch_mode: clean-teaching\n"
+                "patch_concurrency: 4\n"
                 "timeout_seconds: 300\n",
                 encoding="utf-8",
             )
@@ -37,6 +38,7 @@ class RuntimeConfigTest(unittest.TestCase):
             self.assertEqual(settings.prompt_profile, "strict")
             self.assertEqual(settings.prompt_root_dir, Path("custom-prompts"))
             self.assertEqual(settings.patch_mode, "clean-teaching")
+            self.assertEqual(settings.patch_concurrency, 4)
             self.assertEqual(settings.timeout_seconds, 300)
 
     def test_cli_overrides_take_precedence_over_project_config(self) -> None:
@@ -45,7 +47,8 @@ class RuntimeConfigTest(unittest.TestCase):
             (root / "note_refinery.yaml").write_text(
                 "provider: opencode\n"
                 "models:\n"
-                "  patch: deepseek-v4-pro\n",
+                "  patch: deepseek-v4-pro\n"
+                "patch_concurrency: 2\n",
                 encoding="utf-8",
             )
 
@@ -55,6 +58,7 @@ class RuntimeConfigTest(unittest.TestCase):
                 cli_overrides={
                     "patch_model": "deepseek-chat",
                     "patch_mode": "conservative",
+                    "patch_concurrency": 5,
                     "synthesize_model": "deepseek-v4-pro",
                     "prompt_profile": "strict",
                     "prompt_root_dir": "experimental-prompts",
@@ -66,6 +70,7 @@ class RuntimeConfigTest(unittest.TestCase):
             self.assertEqual(settings.prompt_profile, "strict")
             self.assertEqual(settings.prompt_root_dir, Path("experimental-prompts"))
             self.assertEqual(settings.patch_mode, "conservative")
+            self.assertEqual(settings.patch_concurrency, 5)
 
     def test_custom_provider_requires_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
