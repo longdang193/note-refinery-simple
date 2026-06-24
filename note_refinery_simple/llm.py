@@ -9,12 +9,14 @@ from typing import Mapping
 from urllib import request
 
 from note_refinery_simple.config import PROVIDER_BASE_URLS
+from note_refinery_simple.prompts import PromptSet, render_prompt_template
 
 DEFAULT_BASE_URL = PROVIDER_BASE_URLS["deepseek"]
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_REVIEW_MAX_TOKENS = 2000
 DEFAULT_PATCH_MAX_TOKENS = 12000
 DEFAULT_VERIFY_MAX_TOKENS = 2000
+DEFAULT_SYNTHESIZE_MAX_TOKENS = 6000
 DEFAULT_IMAGE_MAX_TOKENS = 800
 SYSTEM_PROMPT = (
     "You are careful and concise. Follow requested output format exactly. "
@@ -33,6 +35,7 @@ class LLMConfig:
     review_model: str = DEFAULT_MODEL
     patch_model: str = DEFAULT_MODEL
     verify_model: str = DEFAULT_MODEL
+    synthesize_model: str = DEFAULT_MODEL
     image_model: str = DEFAULT_MODEL
     timeout_seconds: int = 180
 
@@ -43,6 +46,7 @@ class LLMConfig:
         review_model: str | None = None,
         patch_model: str | None = None,
         verify_model: str | None = None,
+        synthesize_model: str | None = None,
         image_model: str | None = None,
         timeout_seconds: int = 180,
     ) -> "LLMConfig":
@@ -52,6 +56,7 @@ class LLMConfig:
             review_model=review_model,
             patch_model=patch_model,
             verify_model=verify_model,
+            synthesize_model=synthesize_model,
             image_model=image_model,
             timeout_seconds=timeout_seconds,
         )
@@ -64,6 +69,7 @@ class LLMConfig:
         review_model: str | None = None,
         patch_model: str | None = None,
         verify_model: str | None = None,
+        synthesize_model: str | None = None,
         image_model: str | None = None,
         timeout_seconds: int = 180,
     ) -> "LLMConfig":
@@ -96,6 +102,7 @@ class LLMConfig:
             review_model=review_model or default_model,
             patch_model=patch_model or default_model,
             verify_model=verify_model or default_model,
+            synthesize_model=synthesize_model or review_model or default_model,
             image_model=image_model or env.get("OPENAI_COMPATIBLE_IMAGE_MODEL") or default_model,
             timeout_seconds=timeout_seconds,
         )
@@ -108,8 +115,9 @@ def provider_base_url(provider_name: str | None) -> str | None:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(self, config: LLMConfig, prompt_set: PromptSet | None = None) -> None:
         self._config = config
+        self._prompt_set = prompt_set
 
     def run_agent(self, agent_name: str, prompt: str) -> str:
         model = self._model_for(agent_name)
@@ -118,6 +126,7 @@ class OpenAICompatibleClient:
                 model=model,
                 prompt=prompt,
                 max_tokens=self._max_tokens_for(agent_name),
+                system_prompt=self._system_prompt(),
             )
         ).encode("utf-8")
         req = request.Request(
@@ -131,13 +140,18 @@ class OpenAICompatibleClient:
         return str(payload["choices"][0]["message"]["content"])
 
     def describe_image(self, *, image_path: Path, markdown_file: str, nearby_heading: str | None) -> dict[str, object]:
-        prompt = build_image_prompt(markdown_file=markdown_file, nearby_heading=nearby_heading)
+        prompt = build_image_prompt(
+            markdown_file=markdown_file,
+            nearby_heading=nearby_heading,
+            template=None if self._prompt_set is None else self._prompt_set.image_user_prompt,
+        )
         body = json.dumps(
             build_image_request_payload(
                 model=self._config.image_model,
                 prompt=prompt,
                 image_data_url=build_image_data_url(image_path),
                 max_tokens=DEFAULT_IMAGE_MAX_TOKENS,
+                system_prompt=self._image_system_prompt(),
             )
         ).encode("utf-8")
         req = request.Request(
@@ -158,6 +172,8 @@ class OpenAICompatibleClient:
             return self._config.patch_model
         if agent_name == "verifier":
             return self._config.verify_model
+        if agent_name == "synthesizer":
+            return self._config.synthesize_model
         raise ValueError(f"Unknown agent name: {agent_name}")
 
     def _max_tokens_for(self, agent_name: str) -> int:
@@ -167,7 +183,19 @@ class OpenAICompatibleClient:
             return DEFAULT_PATCH_MAX_TOKENS
         if agent_name == "verifier":
             return DEFAULT_VERIFY_MAX_TOKENS
+        if agent_name == "synthesizer":
+            return DEFAULT_SYNTHESIZE_MAX_TOKENS
         raise ValueError(f"Unknown agent name: {agent_name}")
+
+    def _system_prompt(self) -> str:
+        if self._prompt_set is None:
+            return SYSTEM_PROMPT
+        return self._prompt_set.system_prompt
+
+    def _image_system_prompt(self) -> str:
+        if self._prompt_set is None:
+            return IMAGE_SYSTEM_PROMPT
+        return self._prompt_set.image_system_prompt
 
 
 def build_chat_completions_url(base_url: str) -> str:
@@ -186,13 +214,13 @@ def build_headers(api_key: str) -> dict[str, str]:
     }
 
 
-def build_request_payload(model: str, prompt: str, max_tokens: int) -> dict[str, object]:
+def build_request_payload(model: str, prompt: str, max_tokens: int, system_prompt: str = SYSTEM_PROMPT) -> dict[str, object]:
     return {
         "model": model,
         "thinking": {"type": "disabled"},
         "max_tokens": max_tokens,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     }
@@ -203,13 +231,14 @@ def build_image_request_payload(
     prompt: str,
     image_data_url: str,
     max_tokens: int,
+    system_prompt: str = IMAGE_SYSTEM_PROMPT,
 ) -> dict[str, object]:
     return {
         "model": model,
         "thinking": {"type": "disabled"},
         "max_tokens": max_tokens,
         "messages": [
-            {"role": "system", "content": IMAGE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -221,12 +250,20 @@ def build_image_request_payload(
     }
 
 
-def build_image_prompt(markdown_file: str, nearby_heading: str | None) -> str:
-    heading_text = nearby_heading or "none"
-    return (
-        f"Describe image from markdown lecture notes. Markdown file: {markdown_file}. Nearby heading: {heading_text}.\n"
-        "Return JSON only with keys: detected_type, summary, visible_text, chart_structure, possible_risks, confidence.\n"
-        "Use short lists. If text is unreadable, say so in possible_risks."
+def build_image_prompt(markdown_file: str, nearby_heading: str | None, template: str | None = None) -> str:
+    if template is None:
+        heading_text = nearby_heading or "none"
+        return (
+            f"Describe image from markdown lecture notes. Markdown file: {markdown_file}. Nearby heading: {heading_text}.\n"
+            "Return JSON only with keys: detected_type, summary, visible_text, chart_structure, possible_risks, confidence.\n"
+            "Use short lists. If text is unreadable, say so in possible_risks."
+        )
+    return render_prompt_template(
+        template,
+        {
+            "markdown_file": markdown_file,
+            "nearby_heading": nearby_heading or "none",
+        },
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import cast
 
 from note_refinery_simple.llm import (
     LLMConfig,
@@ -39,6 +40,17 @@ class LLMConfigTest(unittest.TestCase):
         self.assertEqual(config.base_url, "https://opencode.ai/zen/go/v1")
         self.assertEqual(config.review_model, "deepseek-v4-pro")
 
+    def test_from_mapping_uses_review_model_as_synthesize_fallback(self) -> None:
+        env = {
+            "OPENAI_COMPATIBLE_API_KEY": "secret",
+            "OPENAI_COMPATIBLE_MODEL": "deepseek-v4-pro",
+        }
+
+        config = LLMConfig.from_mapping(env, review_model="deepseek-v4-pro")
+
+        self.assertEqual(config.review_model, "deepseek-v4-pro")
+        self.assertEqual(config.synthesize_model, "deepseek-v4-pro")
+
 
 class EndpointUrlTest(unittest.TestCase):
     def test_explicit_chat_completions_url_is_not_modified(self) -> None:
@@ -65,12 +77,13 @@ class HeaderTest(unittest.TestCase):
 class PayloadTest(unittest.TestCase):
     def test_payload_disables_thinking(self) -> None:
         payload = build_request_payload(model="deepseek-v4-pro", prompt="Reply with OK", max_tokens=321)
+        messages = cast(list[dict[str, object]], payload["messages"])
 
         self.assertEqual(payload["model"], "deepseek-v4-pro")
         self.assertEqual(payload["thinking"], {"type": "disabled"})
         self.assertEqual(payload["max_tokens"], 321)
-        self.assertEqual(payload["messages"][0]["role"], "system")
-        self.assertEqual(payload["messages"][1]["content"], "Reply with OK")
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["content"], "Reply with OK")
 
     def test_image_payload_contains_text_and_image_url_parts(self) -> None:
         payload = build_image_request_payload(
@@ -82,10 +95,12 @@ class PayloadTest(unittest.TestCase):
 
         self.assertEqual(payload["model"], "minimax-m3")
         self.assertEqual(payload["max_tokens"], 222)
-        message_content = payload["messages"][1]["content"]
+        messages = cast(list[dict[str, object]], payload["messages"])
+        message_content = cast(list[dict[str, object]], messages[1]["content"])
         self.assertEqual(message_content[0]["type"], "text")
         self.assertEqual(message_content[1]["type"], "image_url")
-        self.assertEqual(message_content[1]["image_url"]["url"], "data:image/jpeg;base64,ZmFrZQ==")
+        image_url = cast(dict[str, str], message_content[1]["image_url"])
+        self.assertEqual(image_url["url"], "data:image/jpeg;base64,ZmFrZQ==")
 
 
 class ResponseParsingTest(unittest.TestCase):
@@ -103,7 +118,8 @@ class ResponseParsingTest(unittest.TestCase):
 
         self.assertEqual(parsed["detected_type"], "unknown")
         self.assertEqual(parsed["confidence"], "low")
-        self.assertIn("best-effort", parsed["possible_risks"][0])
+        possible_risks = cast(list[str], parsed["possible_risks"])
+        self.assertIn("best-effort", possible_risks[0])
 
 
 if __name__ == "__main__":

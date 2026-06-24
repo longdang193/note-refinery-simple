@@ -54,6 +54,48 @@ class CliParserTest(unittest.TestCase):
 
             self.assertEqual(args.config, config_path)
 
+    def test_parser_accepts_synthesize_command_and_model_override(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+
+            args = parser.parse_args(
+                [
+                    "synthesize",
+                    "--notes-dir",
+                    str(notes_dir),
+                    "--synthesize-model",
+                    "deepseek-v4-pro",
+                ]
+            )
+
+            self.assertEqual(args.command, "synthesize")
+            self.assertEqual(args.synthesize_model, "deepseek-v4-pro")
+
+    def test_parser_accepts_prompt_profile_overrides(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+
+            args = parser.parse_args(
+                [
+                    "run",
+                    "--notes-dir",
+                    str(notes_dir),
+                    "--prompt-profile",
+                    "strict",
+                    "--prompt-root-dir",
+                    "custom-prompts",
+                ]
+            )
+
+            self.assertEqual(args.prompt_profile, "strict")
+            self.assertEqual(args.prompt_root_dir, "custom-prompts")
+
     def test_load_dotenv_sets_missing_environment_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"

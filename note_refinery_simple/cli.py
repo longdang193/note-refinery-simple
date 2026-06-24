@@ -7,6 +7,7 @@ from pathlib import Path
 from note_refinery_simple.config import load_runtime_settings
 from note_refinery_simple.llm import LLMConfig, OpenAICompatibleClient
 from note_refinery_simple.pipeline import PipelinePaths, ReviewPipeline
+from note_refinery_simple.prompts import load_prompt_set
 
 
 def print_progress(message: str) -> None:
@@ -14,10 +15,10 @@ def print_progress(message: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Review, patch, and verify markdown class notes.")
+    parser = argparse.ArgumentParser(description="Review, patch, verify, and synthesize markdown class notes.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command_name in ("run", "review", "patch", "verify"):
+    for command_name in ("run", "review", "patch", "verify", "synthesize"):
         subparser = subparsers.add_parser(command_name)
         subparser.add_argument("--notes-dir", type=Path, required=True)
         subparser.add_argument("--output-root", type=Path, default=Path.cwd())
@@ -28,7 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--review-model")
         subparser.add_argument("--patch-model")
         subparser.add_argument("--verify-model")
+        subparser.add_argument("--synthesize-model")
         subparser.add_argument("--image-model")
+        subparser.add_argument("--prompt-profile")
+        subparser.add_argument("--prompt-root-dir")
         subparser.add_argument("--timeout-seconds", type=int, default=180)
 
     return parser
@@ -60,7 +64,10 @@ def main() -> int:
             "review_model": args.review_model,
             "patch_model": args.patch_model,
             "verify_model": args.verify_model,
+            "synthesize_model": args.synthesize_model,
             "image_model": args.image_model,
+            "prompt_profile": args.prompt_profile,
+            "prompt_root_dir": args.prompt_root_dir,
             "timeout_seconds": args.timeout_seconds,
         },
     )
@@ -69,15 +76,22 @@ def main() -> int:
         review_model=runtime_settings.review_model,
         patch_model=runtime_settings.patch_model,
         verify_model=runtime_settings.verify_model,
+        synthesize_model=runtime_settings.synthesize_model,
         image_model=runtime_settings.image_model,
         timeout_seconds=runtime_settings.timeout_seconds,
     )
-    client = OpenAICompatibleClient(config)
+    prompt_set = load_prompt_set(
+        project_root=Path.cwd(),
+        prompt_root_dir=runtime_settings.prompt_root_dir,
+        prompt_profile=runtime_settings.prompt_profile,
+    )
+    client = OpenAICompatibleClient(config, prompt_set=prompt_set)
     pipeline = ReviewPipeline(
         client,
         image_enricher=client,
         patch_mode=runtime_settings.patch_mode,
         progress_callback=print_progress,
+        prompt_set=prompt_set,
     )
     paths = PipelinePaths.for_root(args.output_root)
 
@@ -89,6 +103,8 @@ def main() -> int:
         pipeline.write_patched_notes(notes_dir=args.notes_dir, paths=paths)
     elif args.command == "verify":
         pipeline.write_verify(notes_dir=args.notes_dir, paths=paths)
+    elif args.command == "synthesize":
+        pipeline.write_synthesis(notes_dir=args.notes_dir, paths=paths)
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

@@ -4,7 +4,12 @@ models:
   review: deepseek-v4-pro
   patch: deepseek-v4-pro
   verify: deepseek-v4-pro
+  synthesize: deepseek-v4-pro
   image: minimax-m3
+
+prompts:
+  profile: default
+  root_dir: prompts
 
 patch_mode: clean-teaching
 timeout_seconds: 300

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Literal, Mapping, cast
+
+from note_refinery_simple.prompts import DEFAULT_PROMPT_PROFILE, DEFAULT_PROMPT_ROOT_DIR
 
 PatchMode = Literal["clean-teaching", "conservative"]
 
@@ -22,7 +24,10 @@ class RuntimeSettings:
     review_model: str | None
     patch_model: str | None
     verify_model: str | None
+    synthesize_model: str | None
     image_model: str | None
+    prompt_profile: str
+    prompt_root_dir: Path
     patch_mode: PatchMode
     timeout_seconds: int
     config_path: Path | None
@@ -54,6 +59,9 @@ def load_runtime_settings(
     model_config = file_config.get("models")
     if not isinstance(model_config, dict):
         model_config = {}
+    prompt_config = file_config.get("prompts")
+    if not isinstance(prompt_config, dict):
+        prompt_config = {}
 
     patch_mode_value = first_non_none(
         cli_overrides.get("patch_mode"),
@@ -74,9 +82,17 @@ def load_runtime_settings(
         review_model=pick_model(cli_overrides.get("review_model"), model_config.get("review"), env),
         patch_model=pick_model(cli_overrides.get("patch_model"), model_config.get("patch"), env),
         verify_model=pick_model(cli_overrides.get("verify_model"), model_config.get("verify"), env),
+        synthesize_model=pick_model(
+            cli_overrides.get("synthesize_model"),
+            model_config.get("synthesize"),
+            env,
+            fallback_model=pick_model(cli_overrides.get("review_model"), model_config.get("review"), env),
+        ),
         image_model=pick_model(cli_overrides.get("image_model"), model_config.get("image"), env, image=True),
+        prompt_profile=str(first_non_none(cli_overrides.get("prompt_profile"), prompt_config.get("profile"), DEFAULT_PROMPT_PROFILE)),
+        prompt_root_dir=resolve_prompt_root_dir(cli_overrides.get("prompt_root_dir"), prompt_config.get("root_dir")),
         patch_mode=normalize_patch_mode(str(patch_mode_value)),
-        timeout_seconds=int(timeout_value),
+        timeout_seconds=parse_timeout_seconds(timeout_value),
         config_path=config_path,
     )
 
@@ -166,10 +182,11 @@ def pick_model(
     file_value: object,
     env: Mapping[str, str],
     *,
+    fallback_model: str | None = None,
     image: bool = False,
 ) -> str | None:
     env_default = env.get("OPENAI_COMPATIBLE_IMAGE_MODEL") if image else env.get("OPENAI_COMPATIBLE_MODEL")
-    value = first_non_none(cli_value, file_value, env_default, env.get("OPENAI_MODEL"), env.get("DEEPSEEK_MODEL"))
+    value = first_non_none(cli_value, file_value, env_default, env.get("OPENAI_MODEL"), env.get("DEEPSEEK_MODEL"), fallback_model)
     return None if value is None else str(value)
 
 
@@ -183,7 +200,15 @@ def first_non_none(*values: object) -> object | None:
 def normalize_patch_mode(value: str) -> PatchMode:
     if value not in {"clean-teaching", "conservative"}:
         raise ValueError(f"Unsupported patch_mode: {value}")
-    return value
+    return cast(PatchMode, value)
+
+
+def parse_timeout_seconds(value: object | None) -> int:
+    if value is None:
+        return DEFAULT_TIMEOUT_SECONDS
+    if isinstance(value, (int, str)):
+        return int(value)
+    raise ValueError(f"Unsupported timeout_seconds value: {value!r}")
 
 
 def as_optional_str(value: object) -> str | None:
@@ -191,3 +216,10 @@ def as_optional_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def resolve_prompt_root_dir(cli_value: object, file_value: object) -> Path:
+    value = first_non_none(cli_value, file_value, DEFAULT_PROMPT_ROOT_DIR)
+    if isinstance(value, Path):
+        return value
+    return Path(str(value))
