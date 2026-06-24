@@ -81,6 +81,24 @@ class FakeImageEnricher:
             "confidence": "high",
         }
 
+class SlowImageEnricher:
+    def __init__(self, delay_seconds: float = 0.1) -> None:
+        self.delay_seconds = delay_seconds
+        self.calls: list[tuple[str, str, str | None]] = []
+        self._lock = threading.Lock()
+
+    def describe_image(self, *, image_path: Path, markdown_file: str, nearby_heading: str | None) -> dict[str, object]:
+        with self._lock:
+            self.calls.append((str(image_path), markdown_file, nearby_heading))
+        time.sleep(self.delay_seconds)
+        return {
+            "image_path": image_path.name,
+            "markdown_file": markdown_file,
+            "nearby_heading": nearby_heading,
+            "summary": "Slow chart summary.",
+            "confidence": "high",
+        }
+
 
 class FailingImageEnricher:
     def describe_image(self, *, image_path: Path, markdown_file: str, nearby_heading: str | None) -> dict[str, object]:
@@ -171,6 +189,114 @@ class ReviewPipelineTest(unittest.TestCase):
 
             self.assertIn("review: enriching 1 image(s)", messages)
             self.assertIn("review: image 1/1 -> full.md (images/chart.jpg)", messages)
+
+    def test_write_review_can_process_note_folders_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            first_dir = notes_dir / "folder-a"
+            second_dir = notes_dir / "folder-b"
+            for folder in (first_dir, second_dir):
+                images_dir = folder / "images"
+                images_dir.mkdir(parents=True)
+                (images_dir / "chart.jpg").write_bytes(b"fake-jpg")
+                (folder / "full.md").write_text("# Topic\n\n![](images/chart.jpg)\n", encoding="utf-8")
+
+            client = FakeLLMClient(["# Review\n\n- A.", "# Review\n\n- B."])
+            image_enricher = SlowImageEnricher(delay_seconds=0.1)
+            pipeline = ReviewPipeline(
+                client,
+                image_enricher=image_enricher,
+                review_folder_concurrency=2,
+            )
+            paths = PipelinePaths.for_root(root / "out")
+
+            started = time.perf_counter()
+            pipeline.write_review(notes_dir=notes_dir, paths=paths)
+            elapsed = time.perf_counter() - started
+
+            self.assertLess(elapsed, 0.18)
+            self.assertTrue((paths.root / "folder-a" / "reports" / "REVIEW.md").exists())
+            self.assertTrue((paths.root / "folder-b" / "reports" / "REVIEW.md").exists())
+            self.assertFalse((paths.reports_dir / "REVIEW.md").exists())
+
+    def test_write_review_keeps_image_order_sequential_within_each_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            first_dir = notes_dir / "folder-a"
+            second_dir = notes_dir / "folder-b"
+            (first_dir / "images").mkdir(parents=True)
+            (second_dir / "images").mkdir(parents=True)
+            (first_dir / "images" / "chart-1.jpg").write_bytes(b"fake-jpg")
+            (first_dir / "images" / "chart-2.jpg").write_bytes(b"fake-jpg")
+            (second_dir / "images" / "chart.jpg").write_bytes(b"fake-jpg")
+            (first_dir / "full.md").write_text(
+                "# Topic A\n\n![](images/chart-1.jpg)\n![](images/chart-2.jpg)\n",
+                encoding="utf-8",
+            )
+            (second_dir / "full.md").write_text("# Topic B\n\n![](images/chart.jpg)\n", encoding="utf-8")
+
+            client = FakeLLMClient(["# Review\n\n- A.", "# Review\n\n- B."])
+            image_enricher = FakeImageEnricher()
+            pipeline = ReviewPipeline(
+                client,
+                image_enricher=image_enricher,
+                review_folder_concurrency=2,
+            )
+            paths = PipelinePaths.for_root(root / "out")
+
+            pipeline.write_review(notes_dir=notes_dir, paths=paths)
+
+            first_folder_calls = [call[0] for call in image_enricher.calls if "folder-a" in call[0]]
+            self.assertEqual(
+                [Path(call).name for call in first_folder_calls],
+                ["chart-1.jpg", "chart-2.jpg"],
+            )
+
+    def test_write_review_reports_folder_context_during_batch_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name in ("folder-a", "folder-b"):
+                folder = notes_dir / folder_name
+                images_dir = folder / "images"
+                images_dir.mkdir(parents=True)
+                (images_dir / "chart.jpg").write_bytes(b"fake-jpg")
+                (folder / "full.md").write_text("# Topic\n\n![](images/chart.jpg)\n", encoding="utf-8")
+
+            messages: list[str] = []
+            client = FakeLLMClient(["# Review\n\n- A.", "# Review\n\n- B."])
+            pipeline = ReviewPipeline(
+                client,
+                image_enricher=FakeImageEnricher(),
+                review_folder_concurrency=2,
+                progress_callback=messages.append,
+            )
+
+            pipeline.write_review(notes_dir=notes_dir, paths=PipelinePaths.for_root(root / "out"))
+
+            self.assertTrue(any(message.startswith("review: folder 1/2 -> folder-a") for message in messages))
+            self.assertTrue(any(message.endswith("[folder-a]") for message in messages))
+            self.assertTrue(any(message.endswith("[folder-b]") for message in messages))
+
+    def test_write_review_rejects_shared_cached_image_context_for_batch_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name in ("folder-a", "folder-b"):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text("# Topic\n\nBody\n", encoding="utf-8")
+
+            pipeline = ReviewPipeline(FakeLLMClient([]), review_folder_concurrency=2)
+
+            with self.assertRaisesRegex(ValueError, "shared cached image context"):
+                pipeline.write_review(
+                    notes_dir=notes_dir,
+                    paths=PipelinePaths.for_root(root / "out"),
+                    cached_image_contexts=[{"markdown_file": "full.md", "image_path": "images/chart.jpg"}],
+                )
 
     def test_review_keeps_running_when_one_image_enrichment_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -302,6 +428,20 @@ class ReviewPipelineTest(unittest.TestCase):
             self.assertTrue(image_enricher.calls[0][0].endswith("chart-2.jpg"))
             self.assertIn("Cached first chart.", client.calls[0][1])
             self.assertIn("Line chart showing inventory rising then falling.", client.calls[0][1])
+
+    def test_run_rejects_folder_collection_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name in ("folder-a", "folder-b"):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text("# Topic\n\nBody\n", encoding="utf-8")
+
+            pipeline = ReviewPipeline(FakeLLMClient([]), review_folder_concurrency=2)
+
+            with self.assertRaisesRegex(ValueError, "review only"):
+                pipeline.run(notes_dir=notes_dir, paths=PipelinePaths.for_root(root / "out"))
 
     def test_run_can_reuse_cached_review_without_calling_reviewer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

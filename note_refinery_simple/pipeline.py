@@ -51,6 +51,7 @@ TOPIC_STOPWORDS = {
     "von",
 }
 DEFAULT_PATCH_CONCURRENCY = 3
+DEFAULT_REVIEW_FOLDER_CONCURRENCY = 1
 MAX_PATCH_ATTEMPTS_PER_FILE = 3
 MAX_VERIFY_REPAIR_ROUNDS = 2
 
@@ -95,6 +96,7 @@ class ReviewPipeline:
         image_enricher: ImageEnricher | None = None,
         patch_mode: PatchMode = "clean-teaching",
         patch_concurrency: int = DEFAULT_PATCH_CONCURRENCY,
+        review_folder_concurrency: int = DEFAULT_REVIEW_FOLDER_CONCURRENCY,
         progress_callback: ProgressCallback | None = None,
         prompt_set: PromptSet | None = None,
     ) -> None:
@@ -102,6 +104,7 @@ class ReviewPipeline:
         self._image_enricher = image_enricher
         self._patch_mode = patch_mode
         self._patch_concurrency = max(1, patch_concurrency)
+        self._review_folder_concurrency = max(1, review_folder_concurrency)
         self._progress_callback = progress_callback
         self._prompt_set = prompt_set
 
@@ -112,6 +115,9 @@ class ReviewPipeline:
         reuse_review_markdown: str | None = None,
         cached_image_contexts: list[dict[str, object]] | None = None,
     ) -> None:
+        review_note_dirs = collect_review_note_dirs(notes_dir)
+        if len(review_note_dirs) > 1 or review_note_dirs[0] != notes_dir:
+            raise ValueError("Batch folder input is supported for review only. Run the full pipeline per folder.")
         if reuse_review_markdown is not None:
             paths.ensure()
             (paths.reports_dir / "REVIEW.md").write_text(
@@ -146,21 +152,59 @@ class ReviewPipeline:
         paths: PipelinePaths,
         cached_image_contexts: list[dict[str, object]] | None = None,
     ) -> Path:
+        review_note_dirs = collect_review_note_dirs(notes_dir)
+        if len(review_note_dirs) == 1 and review_note_dirs[0] == notes_dir:
+            return self._write_review_single(
+                notes_dir=notes_dir,
+                paths=paths,
+                cached_image_contexts=cached_image_contexts,
+                progress_callback=self._progress_callback,
+            )
+        if cached_image_contexts is not None:
+            raise ValueError("Batch folder review does not accept a shared cached image context artifact")
+        max_workers = min(self._review_folder_concurrency, len(review_note_dirs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            total = len(review_note_dirs)
+            for index, review_dir in enumerate(review_note_dirs, start=1):
+                folder_label = str(review_dir.relative_to(notes_dir)).replace("\\", "/")
+                self._report_progress(f"review: folder {index}/{total} -> {folder_label}")
+                futures.append(
+                    executor.submit(
+                        self._write_review_single,
+                        review_dir,
+                        PipelinePaths.for_root(paths.root / folder_label),
+                        None,
+                        self._folder_progress_callback(folder_label),
+                    )
+                )
+            for future in as_completed(futures):
+                future.result()
+        return paths.root
+
+    def _write_review_single(
+        self,
+        notes_dir: Path,
+        paths: PipelinePaths,
+        cached_image_contexts: list[dict[str, object]] | None,
+        progress_callback: ProgressCallback | None,
+    ) -> Path:
         paths.ensure()
         notes = read_notes(notes_dir)
-        self._report_progress(f"review: loaded {len(notes)} markdown file(s)")
+        if progress_callback is not None:
+            progress_callback(f"review: loaded {len(notes)} markdown file(s)")
         if cached_image_contexts is None:
             image_contexts = build_image_contexts(
                 notes_dir=notes_dir,
                 image_enricher=self._image_enricher,
-                progress_callback=self._progress_callback,
+                progress_callback=progress_callback,
                 image_context_path=paths.reports_dir / "image_context.json",
             )
         else:
             image_contexts = build_image_contexts(
                 notes_dir=notes_dir,
                 image_enricher=self._image_enricher,
-                progress_callback=self._progress_callback,
+                progress_callback=progress_callback,
                 image_context_path=paths.reports_dir / "image_context.json",
                 cached_contexts=cached_image_contexts,
             )
@@ -171,11 +215,13 @@ class ReviewPipeline:
             image_contexts=image_contexts,
             template=None if self._prompt_set is None else self._prompt_set.review_prompt,
         )
-        self._report_progress("review: sending notes to reviewer")
+        if progress_callback is not None:
+            progress_callback("review: sending notes to reviewer")
         content = self._client.run_agent("reviewer", prompt)
         target = paths.reports_dir / "REVIEW.md"
         target.write_text(ensure_trailing_newline(content), encoding="utf-8")
-        self._report_progress("review: wrote REVIEW.md")
+        if progress_callback is not None:
+            progress_callback("review: wrote REVIEW.md")
         return target
 
     def write_patched_notes(
@@ -310,6 +356,23 @@ class ReviewPipeline:
             return
         self._progress_callback(message)
 
+    def _folder_progress_callback(self, folder_label: str) -> ProgressCallback | None:
+        callback = self._progress_callback
+        if callback is None:
+            return None
+        return lambda message: callback(f"{message} [{folder_label}]")
+
+
+def collect_review_note_dirs(notes_dir: Path) -> list[Path]:
+    direct_markdown_files = sorted(path for path in notes_dir.glob("*.md") if path.is_file())
+    if direct_markdown_files:
+        return [notes_dir]
+    review_dirs = [
+        path
+        for path in sorted(notes_dir.iterdir())
+        if path.is_dir() and any(markdown_path.is_file() for markdown_path in path.rglob("*.md"))
+    ]
+    return review_dirs or [notes_dir]
 
 def read_notes(notes_dir: Path) -> dict[str, str]:
     if not notes_dir.exists():

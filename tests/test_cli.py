@@ -76,6 +76,17 @@ class CliParserTest(unittest.TestCase):
 
             self.assertEqual(args.patch_concurrency, 4)
 
+    def test_parser_accepts_review_folder_concurrency(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            notes_dir.mkdir()
+
+            args = parser.parse_args(["run", "--notes-dir", str(notes_dir), "--review-folder-concurrency", "3"])
+
+            self.assertEqual(args.review_folder_concurrency, 3)
+
     def test_parser_accepts_config_path(self) -> None:
         parser = build_parser()
         with tempfile.TemporaryDirectory() as temp_dir:

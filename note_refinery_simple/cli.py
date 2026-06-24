@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--base-url")
         subparser.add_argument("--mode", choices=("clean-teaching", "conservative"), default="clean-teaching")
         subparser.add_argument("--patch-concurrency", type=int)
+        subparser.add_argument("--review-folder-concurrency", type=int)
         subparser.add_argument("--reuse-review-from", type=Path)
         subparser.add_argument("--reuse-image-context-from", type=Path)
         subparser.add_argument("--review-model")
@@ -92,6 +93,7 @@ def main() -> int:
             "base_url": args.base_url,
             "mode": args.mode,
             "patch_concurrency": args.patch_concurrency,
+            "review_folder_concurrency": args.review_folder_concurrency,
             "review_model": args.review_model,
             "patch_model": args.patch_model,
             "verify_model": args.verify_model,
@@ -122,6 +124,7 @@ def main() -> int:
         image_enricher=client,
         patch_mode=runtime_settings.patch_mode,
         patch_concurrency=runtime_settings.patch_concurrency,
+        review_folder_concurrency=runtime_settings.review_folder_concurrency,
         progress_callback=print_progress,
         prompt_set=prompt_set,
     )

@@ -13,4 +13,5 @@ prompts:
 
 patch_mode: clean-teaching
 patch_concurrency: 3
+review_folder_concurrency: 1
 timeout_seconds: 300

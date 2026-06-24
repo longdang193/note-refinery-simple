@@ -11,6 +11,7 @@ PatchMode = Literal["clean-teaching", "conservative"]
 DEFAULT_PROVIDER = "opencode"
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_PATCH_CONCURRENCY = 3
+DEFAULT_REVIEW_FOLDER_CONCURRENCY = 1
 DEFAULT_CONFIG_FILE_NAME = "note_refinery.yaml"
 PROVIDER_BASE_URLS = {
     "opencode": "https://opencode.ai/zen/go/v1",
@@ -31,6 +32,7 @@ class RuntimeSettings:
     prompt_root_dir: Path
     patch_mode: PatchMode
     patch_concurrency: int
+    review_folder_concurrency: int
     timeout_seconds: int
     config_path: Path | None
 
@@ -76,6 +78,11 @@ def load_runtime_settings(
         file_config.get("patch_concurrency"),
         DEFAULT_PATCH_CONCURRENCY,
     )
+    review_folder_concurrency_value = first_non_none(
+        cli_overrides.get("review_folder_concurrency"),
+        file_config.get("review_folder_concurrency"),
+        DEFAULT_REVIEW_FOLDER_CONCURRENCY,
+    )
     timeout_value = first_non_none(
         cli_overrides.get("timeout_seconds"),
         file_config.get("timeout_seconds"),
@@ -100,6 +107,7 @@ def load_runtime_settings(
         prompt_root_dir=resolve_prompt_root_dir(cli_overrides.get("prompt_root_dir"), prompt_config.get("root_dir")),
         patch_mode=normalize_patch_mode(str(patch_mode_value)),
         patch_concurrency=parse_positive_int(patch_concurrency_value, field_name="patch_concurrency"),
+        review_folder_concurrency=parse_positive_int(review_folder_concurrency_value, field_name="review_folder_concurrency"),
         timeout_seconds=parse_positive_int(timeout_value, field_name="timeout_seconds"),
         config_path=config_path,
     )

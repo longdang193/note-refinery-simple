@@ -17,7 +17,7 @@ Prompt text lives in Markdown files under `prompts/`, so you can tune prompt ver
 
 - Python 3.11+
 - `.env` for API key
-- `note_refinery.yaml` for provider, models, prompt profile, patch mode, patch concurrency, and timeout
+- `note_refinery.yaml` for provider, models, prompt profile, patch mode, patch concurrency, review folder concurrency, and timeout
 
 ## Project layout
 
@@ -58,6 +58,7 @@ prompts:
 
 patch_mode: clean-teaching
 patch_concurrency: 3
+review_folder_concurrency: 1
 timeout_seconds: 300
 ```
 
@@ -80,6 +81,7 @@ prompts:
 
 patch_mode: clean-teaching
 patch_concurrency: 3
+review_folder_concurrency: 1
 timeout_seconds: 300
 ```
 
@@ -143,46 +145,54 @@ Patch mode defaults to `clean-teaching`, which rewrites noisy OCR into distilled
 
 Patch execution defaults to `patch_concurrency: 3`. Increase it only if your provider handles parallel requests cleanly.
 
+Batch folder review defaults to `review_folder_concurrency: 1`. Raise it only for `review` over a folder-of-folders input such as `MinerU`. Each folder review runs independently, but images inside one folder stay sequential.
+
 The tool loads `.env` from its own project directory if present.
 
 If `note_refinery.yaml` exists in project root, it is loaded automatically. You can also point to another config file with `--config`.
 
 Useful CLI commands:
 
-Run whole pipeline:
+Run whole pipeline for one note folder:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run"
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run"
 ```
 
 Keep edits closer to source layout:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run-conservative" --mode conservative
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run-conservative" --mode conservative
 ```
 
 Set patch concurrency temporarily:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --patch-concurrency 4
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --patch-concurrency 4
+```
+
+Batch-review many note folders at once:
+
+```powershell
+py -3 -m note_refinery_simple review --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-review" --review-folder-concurrency 3
 ```
 
 Use another config file:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --config ".\note_refinery.yaml"
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --config ".\note_refinery.yaml"
 ```
 
 Override provider or one model temporarily:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --provider custom --base-url "https://my-gateway.example.com/v1" --patch-model deepseek-v4-pro --synthesize-model deepseek-v4-pro
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --provider custom --base-url "https://my-gateway.example.com/v1" --patch-model deepseek-v4-pro --synthesize-model deepseek-v4-pro
 ```
 
 Try another prompt profile temporarily:
 
 ```powershell
-py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\live-run" --prompt-profile strict
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --prompt-profile strict
 ```
 
 Run stages one by one:
@@ -207,11 +217,13 @@ py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\Mine
 
 Stage notes:
 
-- `review` creates `reports/REVIEW.md` and canonical `reports/image_context.json`
+- `review` on one note folder creates `reports/REVIEW.md` and canonical `reports/image_context.json`
+- `review` on a folder of note folders writes one subtree per folder under `output-root/<folder>/reports/`
 - `patch` expects `reports/REVIEW.md` to already exist
 - `verify` expects patched notes in `patched_notes/` and checks them against `REVIEW.md`
 - `synthesize` expects patched notes in `patched_notes/` and `VERIFY.md` in `reports/`
-- `run` is best default when you want full pipeline
+- `run` is best default when you want full pipeline for one note folder
+- batch folder input is supported for `review` only
 
 ## Setup
 

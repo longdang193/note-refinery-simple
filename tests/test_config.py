@@ -72,6 +72,25 @@ class RuntimeConfigTest(unittest.TestCase):
             self.assertEqual(settings.patch_mode, "conservative")
             self.assertEqual(settings.patch_concurrency, 5)
 
+    def test_review_folder_concurrency_uses_same_ssot_resolution_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "note_refinery.yaml").write_text(
+                "provider: opencode\n"
+                "review_folder_concurrency: 2\n"
+                "patch_concurrency: 4\n",
+                encoding="utf-8",
+            )
+
+            settings = load_runtime_settings(
+                cwd=root,
+                env={"OPENAI_COMPATIBLE_API_KEY": "secret"},
+                cli_overrides={"review_folder_concurrency": 5},
+            )
+
+            self.assertEqual(settings.review_folder_concurrency, 5)
+            self.assertEqual(settings.patch_concurrency, 4)
+
     def test_custom_provider_requires_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
