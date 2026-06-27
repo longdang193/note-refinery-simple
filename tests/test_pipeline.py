@@ -126,6 +126,40 @@ def extract_prompt_file_name(prompt: str) -> str | None:
 
 
 class ReviewPipelineTest(unittest.TestCase):
+    def test_write_review_writes_batch_manifest_for_folder_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name in ("folder-a", "folder-b"):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text(f"# {folder_name}\n\nBody\n", encoding="utf-8")
+
+            client = FakeLLMClient(["# Review\n\n- A.", "# Review\n\n- B."])
+            pipeline = ReviewPipeline(client, review_folder_concurrency=2)
+            paths = PipelinePaths.for_root(root / "out")
+
+            pipeline.write_review(notes_dir=notes_dir, paths=paths)
+
+            manifest = json.loads((paths.root / "batch_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest,
+                {
+                    "folders": [
+                        {
+                            "folder_id": "folder-a",
+                            "source_rel_path": "folder-a",
+                            "output_rel_path": "folder-a",
+                        },
+                        {
+                            "folder_id": "folder-b",
+                            "source_rel_path": "folder-b",
+                            "output_rel_path": "folder-b",
+                        },
+                    ]
+                },
+            )
+
     def test_run_reports_stage_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -163,10 +197,10 @@ class ReviewPipelineTest(unittest.TestCase):
 
             self.assertIn("review: loaded 1 markdown file(s)", messages)
             self.assertIn("patch: loaded 1 markdown file(s)", messages)
-            self.assertIn("patch: file 1/1 -> queueing.md", messages)
+            self.assertIn("patch: file 1/1 [queueing.md]", messages)
             self.assertIn("patch: wrote 1 patched file(s)", messages)
-            self.assertIn("verify: wrote VERIFY.md", messages)
-            self.assertIn("synthesize: wrote SYNTHESIS.md and concept_map.json", messages)
+            self.assertIn("verify: done", messages)
+            self.assertIn("synthesize: done", messages)
 
     def test_review_reports_image_enrichment_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -188,7 +222,7 @@ class ReviewPipelineTest(unittest.TestCase):
             pipeline.write_review(notes_dir=notes_dir, paths=paths)
 
             self.assertIn("review: enriching 1 image(s)", messages)
-            self.assertIn("review: image 1/1 -> full.md (images/chart.jpg)", messages)
+            self.assertIn("review: image 1/1", messages)
 
     def test_write_review_can_process_note_folders_concurrently(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -276,9 +310,34 @@ class ReviewPipelineTest(unittest.TestCase):
 
             pipeline.write_review(notes_dir=notes_dir, paths=PipelinePaths.for_root(root / "out"))
 
-            self.assertTrue(any(message.startswith("review: folder 1/2 -> folder-a") for message in messages))
-            self.assertTrue(any(message.endswith("[folder-a]") for message in messages))
-            self.assertTrue(any(message.endswith("[folder-b]") for message in messages))
+            self.assertTrue(any(message == "review [1/2 folder-a] start" for message in messages))
+            self.assertTrue(any(message.startswith("review [folder-a]") for message in messages))
+            self.assertTrue(any(message.startswith("review [folder-b]") for message in messages))
+
+    def test_write_review_shortens_long_folder_scope_in_progress_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            folder_name = "26_1_OPT_II_Introduction.pdf-308ecce5-31c0-4b3f-8d45-4e1a1cb63b4d"
+            folder = notes_dir / folder_name
+            images_dir = folder / "images"
+            images_dir.mkdir(parents=True)
+            (images_dir / "chart.jpg").write_bytes(b"fake-jpg")
+            (folder / "full.md").write_text("# Topic\n\n![](images/chart.jpg)\n", encoding="utf-8")
+
+            messages: list[str] = []
+            client = FakeLLMClient(["# Review\n\n- A."])
+            pipeline = ReviewPipeline(
+                client,
+                image_enricher=FakeImageEnricher(),
+                review_folder_concurrency=1,
+                progress_callback=messages.append,
+            )
+
+            pipeline.write_review(notes_dir=notes_dir, paths=PipelinePaths.for_root(root / "out"))
+
+            self.assertIn("review [1/1 26_1_OPT_II_Introduction] start", messages)
+            self.assertTrue(any(message.startswith("review [26_1_OPT_II_Introduction] image 1/1") for message in messages))
 
     def test_write_review_rejects_shared_cached_image_context_for_batch_folders(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,7 +393,7 @@ class ReviewPipelineTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            progress = ProgressAbort("review: image 2/2 -> full.md (images/chart-2.jpg)")
+            progress = ProgressAbort("review: image 2/2")
             client = FakeLLMClient(["# Review\n\n- Unused because abort happens first."])
             pipeline = ReviewPipeline(
                 client,
@@ -429,7 +488,7 @@ class ReviewPipelineTest(unittest.TestCase):
             self.assertIn("Cached first chart.", client.calls[0][1])
             self.assertIn("Line chart showing inventory rising then falling.", client.calls[0][1])
 
-    def test_run_rejects_folder_collection_input(self) -> None:
+    def test_run_can_process_folder_collection_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             notes_dir = root / "notes"
@@ -438,10 +497,33 @@ class ReviewPipelineTest(unittest.TestCase):
                 folder.mkdir(parents=True)
                 (folder / "full.md").write_text("# Topic\n\nBody\n", encoding="utf-8")
 
-            pipeline = ReviewPipeline(FakeLLMClient([]), review_folder_concurrency=2)
+            client = FakeLLMClient(
+                [
+                    "# Review\n\n- A.",
+                    "# Review\n\n- B.",
+                    json.dumps({"files": {"full.md": "# Topic\n\nPatched A.\n"}}),
+                    json.dumps({"files": {"full.md": "# Topic\n\nPatched B.\n"}}),
+                    "# Verify\n\n## Overall Verdict\n\nPass.\n",
+                    json.dumps(
+                        {
+                            "synthesis_markdown": "# Synthesis\n\nBatch ready.\n",
+                            "concept_map": {"concepts": [], "relationships": []},
+                        }
+                    ),
+                ]
+            )
+            pipeline = ReviewPipeline(client, review_folder_concurrency=2, patch_concurrency=1)
+            paths = PipelinePaths.for_root(root / "out")
 
-            with self.assertRaisesRegex(ValueError, "review only"):
-                pipeline.run(notes_dir=notes_dir, paths=PipelinePaths.for_root(root / "out"))
+            pipeline.run(notes_dir=notes_dir, paths=paths)
+
+            self.assertTrue((paths.root / "batch_manifest.json").exists())
+            self.assertTrue((paths.root / "folder-a" / "reports" / "REVIEW.md").exists())
+            self.assertTrue((paths.root / "folder-b" / "reports" / "REVIEW.md").exists())
+            self.assertTrue((paths.root / "folder-a" / "patched_notes" / "full.md").exists())
+            self.assertTrue((paths.root / "folder-b" / "patched_notes" / "full.md").exists())
+            self.assertEqual((paths.reports_dir / "VERIFY.md").read_text(encoding="utf-8"), "# Verify\n\n## Overall Verdict\n\nPass.\n")
+            self.assertEqual((paths.reports_dir / "SYNTHESIS.md").read_text(encoding="utf-8"), "# Synthesis\n\nBatch ready.\n")
 
     def test_run_can_reuse_cached_review_without_calling_reviewer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -945,11 +1027,206 @@ Good teaching text.
             self.assertEqual((paths.patched_notes_dir / "queueing.md").read_text(encoding="utf-8"), "# Queueing\n\nPatched queueing.\n")
             self.assertEqual((paths.patched_notes_dir / "inventory.md").read_text(encoding="utf-8"), "# Inventory\n\nPatched inventory.\n")
 
+    def test_write_patched_notes_can_patch_all_manifest_listed_folders_from_batch_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name, heading in (("folder-a", "Queueing"), ("folder-b", "Inventory")):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text(f"# {heading}\n\nOriginal text.\n", encoding="utf-8")
+
+            client = FakeLLMClient(
+                [
+                    json.dumps({"files": {"full.md": "# Queueing\n\nPatched queueing.\n"}}),
+                    json.dumps({"files": {"full.md": "# Inventory\n\nPatched inventory.\n"}}),
+                ]
+            )
+            pipeline = ReviewPipeline(client, patch_concurrency=1)
+            paths = PipelinePaths.for_root(root / "out")
+            (paths.root / "folder-a" / "reports").mkdir(parents=True, exist_ok=True)
+            (paths.root / "folder-b" / "reports").mkdir(parents=True, exist_ok=True)
+            (paths.root / "folder-a" / "reports" / "REVIEW.md").write_text("# Review A\n", encoding="utf-8")
+            (paths.root / "folder-b" / "reports" / "REVIEW.md").write_text("# Review B\n", encoding="utf-8")
+            (paths.root / "batch_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "folders": [
+                            {
+                                "folder_id": "folder-a",
+                                "source_rel_path": "folder-a",
+                                "output_rel_path": "folder-a",
+                            },
+                            {
+                                "folder_id": "folder-b",
+                                "source_rel_path": "folder-b",
+                                "output_rel_path": "folder-b",
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            pipeline.write_patched_notes(notes_dir=notes_dir, paths=paths)
+
+            self.assertEqual(
+                (paths.root / "folder-a" / "patched_notes" / "full.md").read_text(encoding="utf-8"),
+                "# Queueing\n\nPatched queueing.\n",
+            )
+            self.assertEqual(
+                (paths.root / "folder-b" / "patched_notes" / "full.md").read_text(encoding="utf-8"),
+                "# Inventory\n\nPatched inventory.\n",
+            )
+
+    def test_write_verify_rejects_incomplete_batch_manifest_before_global_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name in ("folder-a", "folder-b"):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text(f"# {folder_name}\n\nOriginal text.\n", encoding="utf-8")
+
+            client = FakeLLMClient([])
+            pipeline = ReviewPipeline(client)
+            paths = PipelinePaths.for_root(root / "out")
+            (paths.root / "folder-a" / "patched_notes").mkdir(parents=True, exist_ok=True)
+            (paths.root / "folder-a" / "patched_notes" / "full.md").write_text("# folder-a\n\nPatched.\n", encoding="utf-8")
+            (paths.root / "folder-a" / "reports").mkdir(parents=True, exist_ok=True)
+            (paths.root / "folder-a" / "reports" / "REVIEW.md").write_text("# Review A\n", encoding="utf-8")
+            (paths.root / "batch_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "folders": [
+                            {
+                                "folder_id": "folder-a",
+                                "source_rel_path": "folder-a",
+                                "output_rel_path": "folder-a",
+                            },
+                            {
+                                "folder_id": "folder-b",
+                                "source_rel_path": "folder-b",
+                                "output_rel_path": "folder-b",
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "folder-b"):
+                pipeline.write_verify(notes_dir=notes_dir, paths=paths)
+
+    def test_write_verify_writes_one_root_report_for_batch_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name, heading in (("folder-a", "Queueing"), ("folder-b", "Inventory")):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text(f"# {heading}\n\nOriginal text.\n", encoding="utf-8")
+
+            client = FakeLLMClient(["# Verify\n\n## Overall Verdict\n\nPass.\n"])
+            pipeline = ReviewPipeline(client)
+            paths = PipelinePaths.for_root(root / "out")
+            for folder_name, heading in (("folder-a", "Queueing"), ("folder-b", "Inventory")):
+                (paths.root / folder_name / "reports").mkdir(parents=True, exist_ok=True)
+                (paths.root / folder_name / "reports" / "REVIEW.md").write_text(f"# Review {heading}\n", encoding="utf-8")
+                (paths.root / folder_name / "patched_notes").mkdir(parents=True, exist_ok=True)
+                (paths.root / folder_name / "patched_notes" / "full.md").write_text(
+                    f"# {heading}\n\nPatched text.\n",
+                    encoding="utf-8",
+                )
+            (paths.root / "batch_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "folders": [
+                            {
+                                "folder_id": "folder-a",
+                                "source_rel_path": "folder-a",
+                                "output_rel_path": "folder-a",
+                            },
+                            {
+                                "folder_id": "folder-b",
+                                "source_rel_path": "folder-b",
+                                "output_rel_path": "folder-b",
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            target = pipeline.write_verify(notes_dir=notes_dir, paths=paths)
+
+            self.assertEqual(target, paths.reports_dir / "VERIFY.md")
+            self.assertEqual(target.read_text(encoding="utf-8"), "# Verify\n\n## Overall Verdict\n\nPass.\n")
+            self.assertFalse((paths.root / "folder-a" / "reports" / "VERIFY.md").exists())
+            self.assertFalse((paths.root / "folder-b" / "reports" / "VERIFY.md").exists())
+
+    def test_write_synthesis_writes_one_root_report_for_batch_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            notes_dir = root / "notes"
+            for folder_name, heading in (("folder-a", "Queueing"), ("folder-b", "Inventory")):
+                folder = notes_dir / folder_name
+                folder.mkdir(parents=True)
+                (folder / "full.md").write_text(f"# {heading}\n\nOriginal text.\n", encoding="utf-8")
+
+            client = FakeLLMClient(
+                [
+                    json.dumps(
+                        {
+                            "synthesis_markdown": "# Synthesis\n\nMerged batch note.",
+                            "concept_map": {"concepts": [], "relationships": []},
+                        }
+                    )
+                ]
+            )
+            pipeline = ReviewPipeline(client)
+            paths = PipelinePaths.for_root(root / "out")
+            paths.reports_dir.mkdir(parents=True, exist_ok=True)
+            (paths.reports_dir / "VERIFY.md").write_text("# Verify\n\nPass.\n", encoding="utf-8")
+            for folder_name, heading in (("folder-a", "Queueing"), ("folder-b", "Inventory")):
+                (paths.root / folder_name / "reports").mkdir(parents=True, exist_ok=True)
+                (paths.root / folder_name / "reports" / "REVIEW.md").write_text(f"# Review {heading}\n", encoding="utf-8")
+                (paths.root / folder_name / "patched_notes").mkdir(parents=True, exist_ok=True)
+                (paths.root / folder_name / "patched_notes" / "full.md").write_text(
+                    f"# {heading}\n\nPatched text.\n",
+                    encoding="utf-8",
+                )
+            (paths.root / "batch_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "folders": [
+                            {
+                                "folder_id": "folder-a",
+                                "source_rel_path": "folder-a",
+                                "output_rel_path": "folder-a",
+                            },
+                            {
+                                "folder_id": "folder-b",
+                                "source_rel_path": "folder-b",
+                                "output_rel_path": "folder-b",
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            target = pipeline.write_synthesis(notes_dir=notes_dir, paths=paths)
+
+            self.assertEqual(target, paths.reports_dir / "SYNTHESIS.md")
+            self.assertEqual(target.read_text(encoding="utf-8"), "# Synthesis\n\nMerged batch note.\n")
+            self.assertFalse((paths.root / "folder-a" / "reports" / "SYNTHESIS.md").exists())
+            self.assertFalse((paths.root / "folder-b" / "reports" / "SYNTHESIS.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
-

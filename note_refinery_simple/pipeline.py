@@ -54,6 +54,7 @@ DEFAULT_PATCH_CONCURRENCY = 3
 DEFAULT_REVIEW_FOLDER_CONCURRENCY = 1
 MAX_PATCH_ATTEMPTS_PER_FILE = 3
 MAX_VERIFY_REPAIR_ROUNDS = 2
+BATCH_MANIFEST_FILE_NAME = "batch_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,12 @@ class SynthesisPayload:
     synthesis_markdown: str
     concept_map: dict[str, object]
 
+@dataclass(frozen=True)
+class BatchFolder:
+    folder_id: str
+    source_rel_path: str
+    output_rel_path: str
+
 
 class ReviewPipeline:
     def __init__(
@@ -116,8 +123,7 @@ class ReviewPipeline:
         cached_image_contexts: list[dict[str, object]] | None = None,
     ) -> None:
         review_note_dirs = collect_review_note_dirs(notes_dir)
-        if len(review_note_dirs) > 1 or review_note_dirs[0] != notes_dir:
-            raise ValueError("Batch folder input is supported for review only. Run the full pipeline per folder.")
+        is_batch_run = len(review_note_dirs) > 1 or review_note_dirs[0] != notes_dir
         if reuse_review_markdown is not None:
             paths.ensure()
             (paths.reports_dir / "REVIEW.md").write_text(
@@ -135,15 +141,16 @@ class ReviewPipeline:
             )
         self.write_patched_notes(notes_dir=notes_dir, paths=paths)
         verify_path = self.write_verify(notes_dir=notes_dir, paths=paths)
-        note_names = set(read_notes(notes_dir))
-        repair_round = 0
-        flagged_files = extract_flagged_files_from_verify(verify_path.read_text(encoding="utf-8"), note_names)
-        while flagged_files and repair_round < MAX_VERIFY_REPAIR_ROUNDS:
-            repair_round += 1
-            self._report_progress(f"patch: repairing {len(flagged_files)} flagged file(s) after verify")
-            self.write_patched_notes(notes_dir=notes_dir, paths=paths, selected_note_names=flagged_files)
-            verify_path = self.write_verify(notes_dir=notes_dir, paths=paths)
+        if not is_batch_run:
+            note_names = set(read_notes(notes_dir))
+            repair_round = 0
             flagged_files = extract_flagged_files_from_verify(verify_path.read_text(encoding="utf-8"), note_names)
+            while flagged_files and repair_round < MAX_VERIFY_REPAIR_ROUNDS:
+                repair_round += 1
+                self._report_progress(f"patch: repairing {len(flagged_files)} flagged file(s) after verify")
+                self.write_patched_notes(notes_dir=notes_dir, paths=paths, selected_note_names=flagged_files)
+                verify_path = self.write_verify(notes_dir=notes_dir, paths=paths)
+                flagged_files = extract_flagged_files_from_verify(verify_path.read_text(encoding="utf-8"), note_names)
         self.write_synthesis(notes_dir=notes_dir, paths=paths)
 
     def write_review(
@@ -163,12 +170,13 @@ class ReviewPipeline:
         if cached_image_contexts is not None:
             raise ValueError("Batch folder review does not accept a shared cached image context artifact")
         max_workers = min(self._review_folder_concurrency, len(review_note_dirs))
+        write_batch_manifest(paths.root, notes_dir, review_note_dirs)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             total = len(review_note_dirs)
             for index, review_dir in enumerate(review_note_dirs, start=1):
                 folder_label = str(review_dir.relative_to(notes_dir)).replace("\\", "/")
-                self._report_progress(f"review: folder {index}/{total} -> {folder_label}")
+                self._report_progress(f"review [{index}/{total} {short_scope_label(folder_label)}] start")
                 futures.append(
                     executor.submit(
                         self._write_review_single,
@@ -216,15 +224,39 @@ class ReviewPipeline:
             template=None if self._prompt_set is None else self._prompt_set.review_prompt,
         )
         if progress_callback is not None:
-            progress_callback("review: sending notes to reviewer")
+            progress_callback("review: send reviewer")
         content = self._client.run_agent("reviewer", prompt)
         target = paths.reports_dir / "REVIEW.md"
         target.write_text(ensure_trailing_newline(content), encoding="utf-8")
         if progress_callback is not None:
-            progress_callback("review: wrote REVIEW.md")
+            progress_callback("review: done")
         return target
 
     def write_patched_notes(
+        self,
+        notes_dir: Path,
+        paths: PipelinePaths,
+        selected_note_names: set[str] | None = None,
+    ) -> None:
+        batch_folders = resolve_batch_folders(notes_dir, paths.root)
+        if batch_folders is not None:
+            total = len(batch_folders)
+            for index, (_, source_dir, folder_paths) in enumerate(batch_folders, start=1):
+                folder_label = str(source_dir.relative_to(notes_dir)).replace("\\", "/")
+                self._report_progress(f"patch [{index}/{total} {short_scope_label(folder_label)}] start")
+                self._write_patched_notes_single(
+                    notes_dir=source_dir,
+                    paths=folder_paths,
+                    selected_note_names=selected_note_names,
+                )
+            return
+        self._write_patched_notes_single(
+            notes_dir=notes_dir,
+            paths=paths,
+            selected_note_names=selected_note_names,
+        )
+
+    def _write_patched_notes_single(
         self,
         notes_dir: Path,
         paths: PipelinePaths,
@@ -258,7 +290,7 @@ class ReviewPipeline:
             futures = {}
             total = len(notes)
             for index, (note_name, note_content) in enumerate(notes.items(), start=1):
-                self._report_progress(f"patch: file {index}/{total} -> {note_name}")
+                self._report_progress(f"patch: file {index}/{total} [{note_name}]")
                 futures[
                     executor.submit(
                         self._patch_one_note_with_retries,
@@ -318,6 +350,12 @@ class ReviewPipeline:
             return parse_synthesis_payload(repaired_content)
 
     def write_verify(self, notes_dir: Path, paths: PipelinePaths) -> Path:
+        batch_folders = resolve_batch_folders(notes_dir, paths.root)
+        if batch_folders is not None:
+            return self._write_verify_batch(paths=paths, batch_folders=batch_folders)
+        return self._write_verify_single(notes_dir=notes_dir, paths=paths)
+
+    def _write_verify_single(self, notes_dir: Path, paths: PipelinePaths) -> Path:
         paths.ensure()
         prompt = build_verify_prompt(
             original_notes=read_notes(notes_dir),
@@ -330,10 +368,16 @@ class ReviewPipeline:
         content = self._client.run_agent("verifier", prompt)
         target = paths.reports_dir / "VERIFY.md"
         target.write_text(ensure_trailing_newline(content), encoding="utf-8")
-        self._report_progress("verify: wrote VERIFY.md")
+        self._report_progress("verify: done")
         return target
 
     def write_synthesis(self, notes_dir: Path, paths: PipelinePaths) -> Path:
+        batch_folders = resolve_batch_folders(notes_dir, paths.root)
+        if batch_folders is not None:
+            return self._write_synthesis_batch(paths=paths, batch_folders=batch_folders)
+        return self._write_synthesis_single(notes_dir=notes_dir, paths=paths)
+
+    def _write_synthesis_single(self, notes_dir: Path, paths: PipelinePaths) -> Path:
         paths.ensure()
         patched_notes = read_notes(paths.patched_notes_dir)
         self._report_progress(f"synthesize: loaded {len(patched_notes)} patched markdown file(s)")
@@ -348,7 +392,51 @@ class ReviewPipeline:
         target = paths.reports_dir / "SYNTHESIS.md"
         target.write_text(ensure_trailing_newline(payload.synthesis_markdown), encoding="utf-8")
         write_json_file_atomic(paths.reports_dir / "concept_map.json", payload.concept_map)
-        self._report_progress("synthesize: wrote SYNTHESIS.md and concept_map.json")
+        self._report_progress("synthesize: done")
+        return target
+
+    def _write_verify_batch(
+        self,
+        paths: PipelinePaths,
+        batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]],
+    ) -> Path:
+        paths.ensure()
+        ensure_batch_patched_notes_ready(batch_folders)
+        prompt = build_verify_prompt(
+            original_notes=aggregate_batch_notes(batch_folders, use_patched_notes=False),
+            patched_notes=aggregate_batch_notes(batch_folders, use_patched_notes=True),
+            review_markdown=aggregate_batch_reviews(batch_folders),
+            image_contexts=aggregate_batch_image_contexts(batch_folders),
+            template=None if self._prompt_set is None else self._prompt_set.verify_prompt,
+        )
+        self._report_progress("verify: sending notes to verifier")
+        content = self._client.run_agent("verifier", prompt)
+        target = paths.reports_dir / "VERIFY.md"
+        target.write_text(ensure_trailing_newline(content), encoding="utf-8")
+        self._report_progress("verify: done")
+        return target
+
+    def _write_synthesis_batch(
+        self,
+        paths: PipelinePaths,
+        batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]],
+    ) -> Path:
+        paths.ensure()
+        ensure_batch_patched_notes_ready(batch_folders)
+        patched_notes = aggregate_batch_notes(batch_folders, use_patched_notes=True)
+        self._report_progress(f"synthesize: loaded {len(patched_notes)} patched markdown file(s)")
+        prompt = build_synthesis_prompt(
+            patched_notes=patched_notes,
+            review_markdown=aggregate_batch_reviews(batch_folders),
+            verify_markdown=(paths.reports_dir / "VERIFY.md").read_text(encoding="utf-8"),
+            template=None if self._prompt_set is None else self._prompt_set.synthesize_prompt,
+        )
+        self._report_progress("synthesize: sending patched notes to synthesizer")
+        payload = self._parse_or_repair_synthesis_payload(self._client.run_agent("synthesizer", prompt))
+        target = paths.reports_dir / "SYNTHESIS.md"
+        target.write_text(ensure_trailing_newline(payload.synthesis_markdown), encoding="utf-8")
+        write_json_file_atomic(paths.reports_dir / "concept_map.json", payload.concept_map)
+        self._report_progress("synthesize: done")
         return target
 
     def _report_progress(self, message: str) -> None:
@@ -360,7 +448,8 @@ class ReviewPipeline:
         callback = self._progress_callback
         if callback is None:
             return None
-        return lambda message: callback(f"{message} [{folder_label}]")
+        short_label = short_scope_label(folder_label)
+        return lambda message: callback(scope_progress_message(message, short_label))
 
 
 def collect_review_note_dirs(notes_dir: Path) -> list[Path]:
@@ -374,6 +463,74 @@ def collect_review_note_dirs(notes_dir: Path) -> list[Path]:
     ]
     return review_dirs or [notes_dir]
 
+def write_batch_manifest(root: Path, notes_dir: Path, review_note_dirs: list[Path]) -> None:
+    write_json_file_atomic(
+        root / BATCH_MANIFEST_FILE_NAME,
+        {
+            "folders": [
+                {
+                    "folder_id": str(review_dir.relative_to(notes_dir)).replace("\\", "/"),
+                    "source_rel_path": str(review_dir.relative_to(notes_dir)).replace("\\", "/"),
+                    "output_rel_path": str(review_dir.relative_to(notes_dir)).replace("\\", "/"),
+                }
+                for review_dir in review_note_dirs
+            ]
+        },
+    )
+
+def load_batch_manifest(root: Path) -> list[BatchFolder] | None:
+    path = root / BATCH_MANIFEST_FILE_NAME
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    folders = payload.get("folders")
+    if not isinstance(folders, list):
+        raise ValueError("batch_manifest.json must contain a 'folders' list")
+    entries: list[BatchFolder] = []
+    for item in folders:
+        if not isinstance(item, dict):
+            raise ValueError("batch_manifest.json folders must be objects")
+        folder_id = item.get("folder_id")
+        source_rel_path = item.get("source_rel_path")
+        output_rel_path = item.get("output_rel_path")
+        if not all(isinstance(value, str) and value for value in (folder_id, source_rel_path, output_rel_path)):
+            raise ValueError("batch_manifest.json folder entries must include non-empty folder_id, source_rel_path, and output_rel_path")
+        assert isinstance(folder_id, str)
+        assert isinstance(source_rel_path, str)
+        assert isinstance(output_rel_path, str)
+        entries.append(
+            BatchFolder(
+                folder_id=folder_id,
+                source_rel_path=source_rel_path,
+                output_rel_path=output_rel_path,
+            )
+        )
+    return entries
+
+def resolve_batch_folders(notes_dir: Path, output_root: Path) -> list[tuple[BatchFolder, Path, PipelinePaths]] | None:
+    manifest = load_batch_manifest(output_root)
+    if manifest is None:
+        return None
+    return [
+        (
+            entry,
+            notes_dir / Path(entry.source_rel_path),
+            PipelinePaths.for_root(output_root / Path(entry.output_rel_path)),
+        )
+        for entry in manifest
+    ]
+
+def short_scope_label(label: str) -> str:
+    scope = label.replace("\\", "/").split("/")[-1]
+    scope = re.sub(r"\.pdf-[0-9a-f-]+$", "", scope, flags=re.IGNORECASE)
+    return scope
+
+def scope_progress_message(message: str, scope_label: str) -> str:
+    if ": " not in message:
+        return f"{message} [{scope_label}]"
+    stage, detail = message.split(": ", 1)
+    return f"{stage} [{scope_label}] {detail}"
+
 def read_notes(notes_dir: Path) -> dict[str, str]:
     if not notes_dir.exists():
         raise FileNotFoundError(f"Notes directory not found: {notes_dir}")
@@ -385,6 +542,9 @@ def read_notes(notes_dir: Path) -> dict[str, str]:
     if not notes:
         raise ValueError(f"No markdown files found in {notes_dir}")
     return notes
+
+def has_markdown_files(notes_dir: Path) -> bool:
+    return notes_dir.exists() and any(path.is_file() for path in notes_dir.rglob("*.md"))
 
 
 def ensure_trailing_newline(content: str) -> str:
@@ -437,6 +597,51 @@ def parse_synthesis_payload(content: str) -> SynthesisPayload:
     if not isinstance(concept_map, dict):
         raise ValueError("Synthesizer must return object field 'concept_map'")
     return SynthesisPayload(synthesis_markdown=synthesis_markdown, concept_map=concept_map)
+
+def ensure_batch_patched_notes_ready(batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]]) -> None:
+    missing = [
+        folder.folder_id
+        for folder, _, folder_paths in batch_folders
+        if not has_markdown_files(folder_paths.patched_notes_dir)
+    ]
+    if missing:
+        raise ValueError(f"Missing patched content for folder(s): {', '.join(missing)}")
+
+def prefix_note_names(notes: dict[str, str], prefix: str) -> dict[str, str]:
+    return {f"{prefix}/{name}": content for name, content in notes.items()}
+
+def aggregate_batch_notes(
+    batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]],
+    *,
+    use_patched_notes: bool,
+) -> dict[str, str]:
+    aggregated: dict[str, str] = {}
+    for folder, source_dir, folder_paths in batch_folders:
+        note_root = folder_paths.patched_notes_dir if use_patched_notes else source_dir
+        aggregated.update(prefix_note_names(read_notes(note_root), folder.source_rel_path))
+    return aggregated
+
+def aggregate_batch_reviews(batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]]) -> str:
+    sections = []
+    for folder, _, folder_paths in batch_folders:
+        sections.append(
+            f"## {folder.folder_id}\n\n"
+            f"{(folder_paths.reports_dir / 'REVIEW.md').read_text(encoding='utf-8').strip()}"
+        )
+    return "\n\n".join(sections)
+
+def aggregate_batch_image_contexts(
+    batch_folders: list[tuple[BatchFolder, Path, PipelinePaths]],
+) -> list[dict[str, object]]:
+    contexts: list[dict[str, object]] = []
+    for folder, _, folder_paths in batch_folders:
+        for context in load_image_contexts(folder_paths.reports_dir / "image_context.json"):
+            prefixed = dict(context)
+            markdown_file = prefixed.get("markdown_file")
+            if isinstance(markdown_file, str):
+                prefixed["markdown_file"] = f"{folder.source_rel_path}/{markdown_file}"
+            contexts.append(prefixed)
+    return contexts
 
 
 def build_review_prompt(
@@ -622,7 +827,7 @@ def build_image_contexts(
             continue
         if progress_callback is not None:
             progress_callback(
-                f"review: image {index}/{len(tasks)} -> {task.markdown_file} ({task.image_markdown_path})"
+                f"review: image {index}/{len(tasks)}"
             )
         try:
             payload = image_enricher.describe_image(
@@ -634,7 +839,7 @@ def build_image_contexts(
                 raise ValueError("Image enricher must return a dictionary payload")
         except Exception as error:
             if progress_callback is not None:
-                progress_callback(f"review: image fallback -> {task.markdown_file} ({task.image_markdown_path})")
+                progress_callback(f"review: image {index}/{len(tasks)} failed")
             payload = {
                 "detected_type": "unknown",
                 "summary": "Image enrichment failed.",
@@ -824,4 +1029,3 @@ def extract_first_json_object(content: str) -> str:
     decoder = json.JSONDecoder()
     payload, _ = decoder.raw_decode(stripped)
     return json.dumps(payload)
-

@@ -93,29 +93,19 @@ OPENAI_COMPATIBLE_API_KEY=your-api-key
 
 ## Usage
 
-Pipeline overview:
+Pipeline stages:
 
 1. `review`
-   - reads markdown notes
-   - writes `reports/REVIEW.md`
-   - writes canonical `reports/image_context.json` for image enrichment context
-   - persists `image_context.json` incrementally after each image so partial progress survives aborts and reruns
-   - finds formula issues, notation problems, missing assumptions, contradictions, and cross-file inconsistencies
+   - writes `REVIEW.md`
+   - writes canonical `image_context.json`
 2. `patch`
-   - reads original notes and `reports/REVIEW.md`
-   - patches each markdown file in its own LLM call
-   - uses topic guard before accepting each patched file
-   - writes cleaned notes into `patched_notes/`
+   - writes cleaned markdown into `patched_notes/`
 3. `verify`
-   - checks whether patched notes resolved review findings
-   - writes `reports/VERIFY.md`
+   - writes `VERIFY.md`
 4. `synthesize`
-   - reads all patched notes together
-   - writes `reports/SYNTHESIS.md`
-   - writes `reports/concept_map.json`
+   - writes `SYNTHESIS.md` and `concept_map.json`
 5. `run`
    - runs `review -> patch -> verify -> synthesize`
-   - if `VERIFY.md` flags specific files, only those files are repatched and re-verified before synthesis
 
 Outputs:
 
@@ -128,17 +118,29 @@ reports/image_context.json
 patched_notes/*.md
 ```
 
+Batch folder output adds:
+
+```text
+batch_manifest.json
+<folder>/reports/REVIEW.md
+<folder>/reports/image_context.json
+<folder>/patched_notes/*.md
+reports/VERIFY.md
+reports/SYNTHESIS.md
+reports/concept_map.json
+```
+
 Commands print live progress, for example:
 
 ```text
-review: loaded 12 markdown file(s)
-review: enriching 34 image(s)
-review: image 1/34 -> full.md (images/page-01.jpg)
-patch: file 1/12 -> ACT2026_1_Introduction/full.md
+review [1/2 intro] start
+review [intro] image 1/34
+review [intro] send reviewer
+patch: file 1/12 [ACT2026_1_Introduction/full.md]
 patch: topic guard failed -> ACT2026_2_Optimization/full.md
 patch: retry 2/3 -> ACT2026_2_Optimization/full.md
-verify: wrote VERIFY.md
-synthesize: wrote SYNTHESIS.md and concept_map.json
+verify: done
+synthesize: done
 ```
 
 Patch mode defaults to `clean-teaching`, which rewrites noisy OCR into distilled study notes. Use `--mode conservative` if you want lighter edits that stay closer to the source layout.
@@ -151,7 +153,7 @@ The tool loads `.env` from its own project directory if present.
 
 If `note_refinery.yaml` exists in project root, it is loaded automatically. You can also point to another config file with `--config`.
 
-Useful CLI commands:
+### Single Folder
 
 Run whole pipeline for one note folder:
 
@@ -171,11 +173,67 @@ Set patch concurrency temporarily:
 py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --patch-concurrency 4
 ```
 
-Batch-review many note folders at once:
+Run stages one by one for one note folder:
+
+```powershell
+py -3 -m note_refinery_simple review --notes-dir notes --output-root .
+py -3 -m note_refinery_simple patch --notes-dir notes --output-root . --mode clean-teaching
+py -3 -m note_refinery_simple verify --notes-dir notes --output-root .
+py -3 -m note_refinery_simple synthesize --notes-dir notes --output-root .
+```
+
+### Folder Batch
+
+Run whole pipeline for folder-of-folders:
+
+```powershell
+py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-run"
+```
+
+Run batch review only:
 
 ```powershell
 py -3 -m note_refinery_simple review --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-review" --review-folder-concurrency 3
 ```
+
+Run batch patch only:
+
+```powershell
+py -3 -m note_refinery_simple patch --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-review"
+```
+
+Run batch verify only:
+
+```powershell
+py -3 -m note_refinery_simple verify --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-review"
+```
+
+Run batch synthesize only:
+
+```powershell
+py -3 -m note_refinery_simple synthesize --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU" --output-root ".\batch-review"
+```
+
+Folder batch flow summary:
+
+```text
+run         -> review + patch + verify + synthesize
+review      -> writes batch_manifest.json and per-folder REVIEW.md
+patch       -> writes per-folder patched_notes/
+verify      -> writes one root reports/VERIFY.md
+synthesize  -> writes one root reports/SYNTHESIS.md and reports/concept_map.json
+```
+
+Important:
+
+```text
+single-folder run can do selective repair after verify
+folder-batch run does one lazy pass: review -> patch -> verify -> synthesize
+batch verify and batch synthesize run once at batch root, not per folder
+batch verify requires every folder in batch_manifest.json to already have patched_notes/
+```
+
+### Overrides
 
 Use another config file:
 
@@ -195,15 +253,6 @@ Try another prompt profile temporarily:
 py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\MinerU\ACT2026_11_Genetic Algorithms.pdf-fa380dba-3ab3-4050-b4c3-335013a3597d" --output-root ".\live-run" --prompt-profile strict
 ```
 
-Run stages one by one:
-
-```powershell
-py -3 -m note_refinery_simple review --notes-dir notes --output-root .
-py -3 -m note_refinery_simple patch --notes-dir notes --output-root . --mode clean-teaching
-py -3 -m note_refinery_simple verify --notes-dir notes --output-root .
-py -3 -m note_refinery_simple synthesize --notes-dir notes --output-root .
-```
-
 Fast rerun with cached artifacts:
 
 `--reuse-image-context-from` can point at full or partial `reports/image_context.json`. Missing images are enriched live, then merged back into canonical cache file for current run.
@@ -218,12 +267,15 @@ py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\Mine
 Stage notes:
 
 - `review` on one note folder creates `reports/REVIEW.md` and canonical `reports/image_context.json`
-- `review` on a folder of note folders writes one subtree per folder under `output-root/<folder>/reports/`
-- `patch` expects `reports/REVIEW.md` to already exist
-- `verify` expects patched notes in `patched_notes/` and checks them against `REVIEW.md`
-- `synthesize` expects patched notes in `patched_notes/` and `VERIFY.md` in `reports/`
-- `run` is best default when you want full pipeline for one note folder
-- batch folder input is supported for `review` only
+- `review` on a folder of note folders writes `batch_manifest.json` plus one subtree per folder under `output-root/<folder>/reports/`
+- `patch` on one note folder expects `reports/REVIEW.md` to already exist
+- `patch` on batch root reads `batch_manifest.json` and patches every listed folder into `output-root/<folder>/patched_notes/`
+- `verify` on one note folder expects patched notes in `patched_notes/` and checks them against `REVIEW.md`
+- `verify` on batch root requires every manifest-listed folder to already have `patched_notes/`, then writes one root `reports/VERIFY.md`
+- `synthesize` on one note folder expects patched notes in `patched_notes/` and `VERIFY.md` in `reports/`
+- `synthesize` on batch root reads all manifest-listed patched folders together, then writes one root `reports/SYNTHESIS.md` and `reports/concept_map.json`
+- `run` works for both one note folder and folder batch
+- batch means full discovered folder set for one review run, not review worker chunking
 
 ## Setup
 
