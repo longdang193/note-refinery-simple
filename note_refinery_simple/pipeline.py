@@ -831,6 +831,7 @@ def build_verify_prompt(
         "Check whether patched notes resolve REVIEW.md findings without adding obvious new contradictions.\n"
         "Include cross-file consistency in your checks when multiple files are present.\n"
         "Use image context when available to check whether chart or diagram meaning still matches the patched notes.\n"
+        "If patched notes do not reconcile source-code bookkeeping or index-shift logic into one explicit mapping example, leave bookkeeping or indexing findings unresolved.\n"
         "Output Markdown for VERIFY.md with sections: Verified Resolved, Not Resolved, Possible Regressions, Overall Verdict.\n\n"
         f"REVIEW_MD\n{review_markdown}\n\n"
         f"ORIGINAL_NOTES\n{render_notes(original_notes)}\n\n"
@@ -1047,6 +1048,7 @@ def build_patch_mode_instructions(patch_mode: PatchMode) -> str:
             "Do not rewrite structure more than needed to fix REVIEW.md findings.\n"
             "Include short code snippets for illustration when they clarify logic.\n"
             "Keep fenced code blocks syntactically correct and preserve Python indentation inside them.\n"
+            "For bookkeeping, index shifts, or RL return alignment, derive one explicit step-by-step mapping from source code instead of vague intent language.\n"
             "Do not invent new algebra, new notation, or new assumptions unless REVIEW.md explicitly calls for that correction.\n"
             "When rewriting formulas, preserve formula meaning exactly and keep mathematically equivalent expressions only when you are certain.\n"
         )
@@ -1059,6 +1061,7 @@ def build_patch_mode_instructions(patch_mode: PatchMode) -> str:
         "Prefer short explanatory prose and keep only equations that materially help a student learn the topic.\n"
         "Include short code snippets for illustration when they clarify logic.\n"
         "Keep fenced code blocks syntactically correct and preserve Python indentation inside them.\n"
+        "For bookkeeping, index shifts, or RL return alignment, derive one explicit step-by-step mapping from source code instead of vague intent language.\n"
         "Drop auxiliary derivation symbols, repeated intermediate algebra, and low-value chart narration unless they are essential for understanding.\n"
         "Do not invent new algebra, new notation, or new assumptions unless REVIEW.md explicitly calls for that correction.\n"
         "When rewriting formulas, preserve formula meaning exactly and keep mathematically equivalent expressions only when you are certain.\n"

@@ -21,6 +21,17 @@ class PromptLoadingTest(unittest.TestCase):
             self.assertIn("lecture source files", prompt_set.verify_prompt)
             self.assertIn("lecture source", prompt_set.synthesize_prompt)
 
+    def test_loaded_prompt_profiles_require_source_grounded_bookkeeping_reconciliation(self) -> None:
+        for profile in ("default", "strict"):
+            prompt_set = load_prompt_set(
+                project_root=Path(r"C:\Users\HOANG PHI LONG DANG\repos\note-refinery-simple"),
+                prompt_root_dir=Path("prompts"),
+                prompt_profile=profile,
+            )
+
+            self.assertIn("derive one explicit step-by-step mapping from source code", prompt_set.patch_prompt)
+            self.assertIn("leave bookkeeping or indexing findings unresolved", prompt_set.verify_prompt)
+
     def test_load_prompt_set_reads_markdown_prompt_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -12,6 +12,7 @@ from note_refinery_simple.pipeline import (
     ReviewPipeline,
     build_patch_prompt,
     build_review_prompt,
+    build_verify_prompt,
     build_synthesis_prompt,
     collect_review_note_dirs,
     collect_image_tasks,
@@ -894,6 +895,24 @@ def act(state: dict) -> bool:
         )
 
         self.assertIn("Include short code snippets", prompt)
+
+    def test_patch_prompt_requires_explicit_source_grounded_bookkeeping_derivations(self) -> None:
+        prompt = build_patch_prompt(
+            notes={"full.py.md": "# Example\n\nMonte Carlo RL note.\n"},
+            review_markdown="# Review\n\n- Reconcile PDS indexing and reward alignment.",
+            patch_mode="clean-teaching",
+        )
+
+        self.assertIn("derive one explicit step-by-step mapping from source code", prompt)
+
+    def test_verify_prompt_requires_bookkeeping_findings_to_stay_open_without_reconciliation(self) -> None:
+        prompt = build_verify_prompt(
+            original_notes={"full.py.md": "# Original\n\nPDS note.\n"},
+            patched_notes={"full.py.md": "# Patched\n\nPDS note.\n"},
+            review_markdown="# Review\n\n- Reconcile PDS indexing and reward alignment.",
+        )
+
+        self.assertIn("leave bookkeeping or indexing findings unresolved", prompt)
 
     def test_parse_patch_payload_accepts_fenced_json_with_trailing_text(self) -> None:
         payload = parse_patch_payload(
