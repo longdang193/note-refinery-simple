@@ -13,10 +13,12 @@ from note_refinery_simple.pipeline import (
     build_patch_prompt,
     build_review_prompt,
     build_synthesis_prompt,
+    collect_review_note_dirs,
     collect_image_tasks,
     clean_patched_markdown,
     parse_patch_payload,
     parse_synthesis_payload,
+    read_notes,
 )
 from note_refinery_simple.prompts import PromptSet
 
@@ -126,6 +128,148 @@ def extract_prompt_file_name(prompt: str) -> str | None:
 
 
 class ReviewPipelineTest(unittest.TestCase):
+    def test_read_notes_loads_supported_source_types_with_canonical_logical_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            (notes_dir / "lesson.md").write_text("# Lesson\n\nBody\n", encoding="utf-8")
+            (notes_dir / "solver.py").write_text("print('hello')\n", encoding="utf-8")
+            (notes_dir / "lab.ipynb").write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {"cell_type": "markdown", "metadata": {}, "source": ["# Lab\n"]},
+                            {"cell_type": "code", "metadata": {}, "execution_count": 1, "outputs": [], "source": ["x = 1\n"]},
+                        ],
+                        "metadata": {},
+                        "nbformat": 4,
+                        "nbformat_minor": 5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            notes = read_notes(notes_dir)
+
+            self.assertEqual(set(notes), {"lesson.md", "solver.py.md", "lab.ipynb.md"})
+            self.assertIn("print('hello')", notes["solver.py.md"])
+            self.assertIn("# Lab", notes["lab.ipynb.md"])
+
+    def test_collect_review_note_dirs_includes_child_folders_with_python_or_notebook_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            folder_a = notes_dir / "folder-a"
+            folder_b = notes_dir / "folder-b"
+            folder_a.mkdir(parents=True)
+            folder_b.mkdir(parents=True)
+            (folder_a / "solver.py").write_text("print('a')\n", encoding="utf-8")
+            (folder_b / "lab.ipynb").write_text(
+                json.dumps({"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}),
+                encoding="utf-8",
+            )
+
+            review_dirs = collect_review_note_dirs(notes_dir)
+
+            self.assertEqual(review_dirs, [folder_a, folder_b])
+
+    def test_collect_review_note_dirs_rejects_mixed_root_and_child_source_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            (notes_dir / "lesson.md").write_text("# Root\n", encoding="utf-8")
+            folder_a = notes_dir / "folder-a"
+            folder_a.mkdir(parents=True)
+            (folder_a / "solver.py").write_text("print('a')\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "mixed"):
+                collect_review_note_dirs(notes_dir)
+
+    def test_read_notes_and_batch_detection_ignore_generated_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            folder_a = notes_dir / "folder-a"
+            folder_a.mkdir(parents=True)
+            (folder_a / "lesson.md").write_text("# Lesson\n", encoding="utf-8")
+            checkpoint_dir = notes_dir / ".ipynb_checkpoints"
+            checkpoint_dir.mkdir(parents=True)
+            (checkpoint_dir / "shadow.ipynb").write_text(
+                json.dumps({"cells": [], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}),
+                encoding="utf-8",
+            )
+            venv_dir = notes_dir / ".venv" / "lib"
+            venv_dir.mkdir(parents=True)
+            (venv_dir / "noise.py").write_text("print('noise')\n", encoding="utf-8")
+
+            review_dirs = collect_review_note_dirs(notes_dir)
+            notes = read_notes(notes_dir)
+
+            self.assertEqual(review_dirs, [folder_a])
+            self.assertEqual(set(notes), {"folder-a/lesson.md"})
+
+    def test_read_notes_normalizes_notebook_plain_text_outputs_in_source_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            (notes_dir / "lab.ipynb").write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {"cell_type": "markdown", "metadata": {}, "source": ["# Lab\n"]},
+                            {
+                                "cell_type": "code",
+                                "metadata": {},
+                                "execution_count": 1,
+                                "source": ["print('hi')\n"],
+                                "outputs": [
+                                    {"output_type": "stream", "name": "stdout", "text": ["hi\n"]},
+                                    {"output_type": "execute_result", "data": {"text/plain": ["42"]}, "metadata": {}, "execution_count": 1},
+                                ],
+                            },
+                        ],
+                        "metadata": {},
+                        "nbformat": 4,
+                        "nbformat_minor": 5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            notes = read_notes(notes_dir)
+
+            notebook_text = notes["lab.ipynb.md"]
+            self.assertIn("# Lab", notebook_text)
+            self.assertIn("```python\nprint('hi')", notebook_text)
+            self.assertIn("```text\nhi\n```", notebook_text)
+            self.assertIn("```text\n42\n```", notebook_text)
+
+    def test_read_notes_omits_unsupported_notebook_rich_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notes_dir = Path(temp_dir)
+            (notes_dir / "lab.ipynb").write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {
+                                "cell_type": "code",
+                                "metadata": {},
+                                "execution_count": 1,
+                                "source": ["display('x')\n"],
+                                "outputs": [
+                                    {"output_type": "display_data", "data": {"image/png": "abc", "text/html": ["<b>x</b>"]}, "metadata": {}},
+                                ],
+                            },
+                        ],
+                        "metadata": {},
+                        "nbformat": 4,
+                        "nbformat_minor": 5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            notes = read_notes(notes_dir)
+
+            notebook_text = notes["lab.ipynb.md"]
+            self.assertNotIn("image/png", notebook_text)
+            self.assertNotIn("<b>x</b>", notebook_text)
+
     def test_write_review_writes_batch_manifest_for_folder_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -722,6 +866,34 @@ Good teaching text.
         self.assertNotIn("![](images/chart.jpg)", cleaned)
         self.assertEqual(cleaned.count("## EPQ with Transport Batches"), 1)
         self.assertIn("### Core idea", cleaned)
+
+    def test_clean_patched_markdown_preserves_fenced_code_indentation(self) -> None:
+        cleaned = clean_patched_markdown(
+            """
+## Example
+
+```python
+def act(state: dict) -> bool:
+    if state["Item"].weight <= state["Cur_Cap"]:
+        return True
+    return False
+```
+"""
+        )
+
+        self.assertIn("```python", cleaned)
+        self.assertIn("    if state[\"Item\"].weight <= state[\"Cur_Cap\"]:", cleaned)
+        self.assertIn("        return True", cleaned)
+        self.assertIn("```", cleaned)
+
+    def test_patch_prompt_requests_short_code_snippets_for_illustration(self) -> None:
+        prompt = build_patch_prompt(
+            notes={"full.py.md": "# Example\n\n```python\nprint('x')\n```\n"},
+            review_markdown="# Review\n\n- Clarify policy behavior.",
+            patch_mode="clean-teaching",
+        )
+
+        self.assertIn("Include short code snippets", prompt)
 
     def test_parse_patch_payload_accepts_fenced_json_with_trailing_text(self) -> None:
         payload = parse_patch_payload(

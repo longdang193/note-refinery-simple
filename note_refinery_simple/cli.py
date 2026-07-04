@@ -21,7 +21,7 @@ def print_progress(message: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Review, patch, verify, and synthesize markdown class notes.")
+    parser = argparse.ArgumentParser(description="Review, patch, verify, and synthesize lecture source files into markdown notes.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     for command_name in ("run", "review", "patch", "verify", "synthesize"):

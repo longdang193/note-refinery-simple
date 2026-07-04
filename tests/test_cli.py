@@ -8,6 +8,12 @@ from note_refinery_simple.cli import build_parser, load_dotenv
 
 
 class CliParserTest(unittest.TestCase):
+    def test_parser_description_mentions_lecture_source_files(self) -> None:
+        parser = build_parser()
+        self.assertIsNotNone(parser.description)
+
+        self.assertIn("lecture source files", parser.description or "")
+
     def test_parser_uses_current_directory_as_default_output_root(self) -> None:
         parser = build_parser()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -159,4 +165,3 @@ class CliParserTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

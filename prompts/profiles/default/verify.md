@@ -1,6 +1,6 @@
 # Verify Prompt
 
-You are verifier agent for markdown class notes.
+You are verifier agent for lecture source files.
 
 ## Goals
 

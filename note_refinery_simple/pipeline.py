@@ -55,6 +55,8 @@ DEFAULT_REVIEW_FOLDER_CONCURRENCY = 1
 MAX_PATCH_ATTEMPTS_PER_FILE = 3
 MAX_VERIFY_REPAIR_ROUNDS = 2
 BATCH_MANIFEST_FILE_NAME = "batch_manifest.json"
+SOURCE_EXTENSIONS = {".md", ".py", ".ipynb"}
+IGNORED_SOURCE_DIR_NAMES = {".git", ".ipynb_checkpoints", ".venv", "__pycache__"}
 
 
 @dataclass(frozen=True)
@@ -453,15 +455,35 @@ class ReviewPipeline:
 
 
 def collect_review_note_dirs(notes_dir: Path) -> list[Path]:
-    direct_markdown_files = sorted(path for path in notes_dir.glob("*.md") if path.is_file())
-    if direct_markdown_files:
-        return [notes_dir]
+    direct_source_files = list(iter_direct_source_files(notes_dir))
     review_dirs = [
         path
         for path in sorted(notes_dir.iterdir())
-        if path.is_dir() and any(markdown_path.is_file() for markdown_path in path.rglob("*.md"))
+        if path.is_dir() and path.name not in IGNORED_SOURCE_DIR_NAMES and has_markdown_files(path)
     ]
+    if direct_source_files and review_dirs:
+        raise ValueError(f"Found mixed root and child source layout in {notes_dir}")
+    if direct_source_files:
+        return [notes_dir]
     return review_dirs or [notes_dir]
+
+def iter_direct_source_files(notes_dir: Path) -> list[Path]:
+    if not notes_dir.exists():
+        return []
+    return [path for path in sorted(notes_dir.iterdir()) if path.is_file() and path.suffix.lower() in SOURCE_EXTENSIONS]
+
+def iter_source_files(notes_dir: Path) -> list[Path]:
+    if not notes_dir.exists():
+        return []
+    source_files: list[Path] = []
+    for path in sorted(notes_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in SOURCE_EXTENSIONS:
+            continue
+        relative_parts = path.relative_to(notes_dir).parts[:-1]
+        if any(part in IGNORED_SOURCE_DIR_NAMES for part in relative_parts):
+            continue
+        source_files.append(path)
+    return source_files
 
 def write_batch_manifest(root: Path, notes_dir: Path, review_note_dirs: list[Path]) -> None:
     write_json_file_atomic(
@@ -535,16 +557,99 @@ def read_notes(notes_dir: Path) -> dict[str, str]:
     if not notes_dir.exists():
         raise FileNotFoundError(f"Notes directory not found: {notes_dir}")
     notes = {
-        str(path.relative_to(notes_dir)).replace("\\", "/"): path.read_text(encoding="utf-8")
-        for path in sorted(notes_dir.rglob("*.md"))
-        if path.is_file()
+        source_logical_name(path, notes_dir): read_source_file_as_markdown(path)
+        for path in iter_source_files(notes_dir)
     }
     if not notes:
-        raise ValueError(f"No markdown files found in {notes_dir}")
+        raise ValueError(f"No supported source files found in {notes_dir}")
     return notes
 
 def has_markdown_files(notes_dir: Path) -> bool:
-    return notes_dir.exists() and any(path.is_file() for path in notes_dir.rglob("*.md"))
+    return bool(iter_source_files(notes_dir))
+
+def source_logical_name(path: Path, notes_dir: Path) -> str:
+    relative_path = str(path.relative_to(notes_dir)).replace("\\", "/")
+    if path.suffix.lower() == ".md":
+        return relative_path
+    return f"{relative_path}.md"
+
+def read_source_file_as_markdown(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".md":
+        return path.read_text(encoding="utf-8")
+    if suffix == ".py":
+        return render_python_source_as_markdown(path)
+    if suffix == ".ipynb":
+        return render_notebook_source_as_markdown(path)
+    raise ValueError(f"Unsupported source file: {path}")
+
+def render_python_source_as_markdown(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    return f"# {path.name}\n\n```python\n{source.rstrip()}\n```\n"
+
+def render_notebook_source_as_markdown(path: Path) -> str:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cells = payload.get("cells", [])
+    if not isinstance(cells, list):
+        raise ValueError(f"Notebook cells must be a list: {path}")
+    blocks: list[str] = [f"# {path.name}"]
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        cell_type = cell.get("cell_type")
+        source = join_text_lines(cell.get("source"))
+        if cell_type == "markdown":
+            if source.strip():
+                blocks.append(source.rstrip())
+            continue
+        if cell_type != "code":
+            continue
+        blocks.append(render_fenced_block("python", source))
+        for output_text in iter_notebook_output_texts(cell.get("outputs")):
+            blocks.append(render_fenced_block("text", output_text))
+    return ensure_trailing_newline("\n\n".join(blocks).strip())
+
+def iter_notebook_output_texts(outputs: object) -> list[str]:
+    if not isinstance(outputs, list):
+        return []
+    collected: list[str] = []
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        output_type = output.get("output_type")
+        if output_type == "stream":
+            text = join_text_lines(output.get("text")).rstrip()
+            if text:
+                collected.append(text)
+            continue
+        if output_type in {"execute_result", "display_data"}:
+            text = extract_notebook_text_plain(output.get("data")).rstrip()
+            if text:
+                collected.append(text)
+            continue
+        if output_type == "error":
+            text = join_text_lines(output.get("traceback")).rstrip()
+            if text:
+                collected.append(text)
+    return collected
+
+def extract_notebook_text_plain(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    return join_text_lines(data.get("text/plain"))
+
+def join_text_lines(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(item for item in value if isinstance(item, str))
+    return ""
+
+def render_fenced_block(language: str, content: str) -> str:
+    fence = "```"
+    if "```" in content:
+        fence = "````"
+    return f"{fence}{language}\n{content.rstrip()}\n{fence}"
 
 
 def ensure_trailing_newline(content: str) -> str:
@@ -659,7 +764,7 @@ def build_review_prompt(
             },
         )
     return (
-        "You are reviewer agent for markdown class notes.\n"
+        "You are reviewer agent for lecture source files.\n"
         "Find incorrect formulas, missing assumptions, inconsistent notation, contradictions, and unclear statements.\n"
         "Also check cross-file consistency.\n"
         "Find symbols defined differently across files, contradictory assumptions across files, formulas that conflict between files, and terminology drift between files.\n"
@@ -691,7 +796,7 @@ def build_patch_prompt(
             },
         )
     return (
-        "You are patcher agent for markdown class notes.\n"
+        "You are patcher agent for lecture source files.\n"
         "Use REVIEW.md findings to create corrected versions of every note.\n"
         "Use patch image context only as supporting evidence for chart or diagram meaning.\n"
         "Do not omit files.\n"
@@ -722,7 +827,7 @@ def build_verify_prompt(
             },
         )
     return (
-        "You are verifier agent for markdown class notes.\n"
+        "You are verifier agent for lecture source files.\n"
         "Check whether patched notes resolve REVIEW.md findings without adding obvious new contradictions.\n"
         "Include cross-file consistency in your checks when multiple files are present.\n"
         "Use image context when available to check whether chart or diagram meaning still matches the patched notes.\n"
@@ -749,7 +854,7 @@ def build_synthesis_prompt(
             },
         )
     return (
-        "You are synthesizer agent for patched markdown class notes.\n"
+        "You are synthesizer agent for patched lecture source notes.\n"
         "Create one structured, interconnected teaching note across all patched sources.\n"
         "Make cross-source relationships explicit. Identify prerequisite chains, concept dependencies, consistent definitions, and remaining tensions.\n"
         "Prefer compact teaching language over verbose summaries.\n"
@@ -940,6 +1045,8 @@ def build_patch_mode_instructions(patch_mode: PatchMode) -> str:
         return (
             "Preserve headings and teaching style where possible.\n"
             "Do not rewrite structure more than needed to fix REVIEW.md findings.\n"
+            "Include short code snippets for illustration when they clarify logic.\n"
+            "Keep fenced code blocks syntactically correct and preserve Python indentation inside them.\n"
             "Do not invent new algebra, new notation, or new assumptions unless REVIEW.md explicitly calls for that correction.\n"
             "When rewriting formulas, preserve formula meaning exactly and keep mathematically equivalent expressions only when you are certain.\n"
         )
@@ -950,6 +1057,8 @@ def build_patch_mode_instructions(patch_mode: PatchMode) -> str:
         "Merge duplicate headings and restructure freely when original structure is noisy.\n"
         "Prefer compact explanations, clear derivations, and readable sectioning over preserving original layout.\n"
         "Prefer short explanatory prose and keep only equations that materially help a student learn the topic.\n"
+        "Include short code snippets for illustration when they clarify logic.\n"
+        "Keep fenced code blocks syntactically correct and preserve Python indentation inside them.\n"
         "Drop auxiliary derivation symbols, repeated intermediate algebra, and low-value chart narration unless they are essential for understanding.\n"
         "Do not invent new algebra, new notation, or new assumptions unless REVIEW.md explicitly calls for that correction.\n"
         "When rewriting formulas, preserve formula meaning exactly and keep mathematically equivalent expressions only when you are certain.\n"
@@ -960,7 +1069,19 @@ def clean_patched_markdown(content: str) -> str:
     cleaned_lines: list[str] = []
     previous_heading: str | None = None
     blank_line_count = 0
+    in_fenced_code_block = False
     for raw_line in content.splitlines():
+        stripped_line = raw_line.strip()
+        if stripped_line.startswith("```"):
+            cleaned_lines.append(stripped_line)
+            previous_heading = None
+            blank_line_count = 0
+            in_fenced_code_block = not in_fenced_code_block
+            continue
+        if in_fenced_code_block:
+            cleaned_lines.append(raw_line.rstrip())
+            blank_line_count = 0
+            continue
         line = raw_line.strip()
         if not line:
             if cleaned_lines and blank_line_count == 0:

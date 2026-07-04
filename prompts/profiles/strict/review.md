@@ -1,6 +1,6 @@
 # Review Prompt
 
-You are reviewer agent for markdown class notes.
+You are reviewer agent for lecture source files.
 
 ## Goals
 

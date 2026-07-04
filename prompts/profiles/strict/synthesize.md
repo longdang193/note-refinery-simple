@@ -1,6 +1,6 @@
 # Synthesize Prompt
 
-You are synthesizer agent for patched markdown class notes.
+You are synthesizer agent for patched lecture source notes.
 
 ## Goals
 

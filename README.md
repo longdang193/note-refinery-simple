@@ -1,6 +1,12 @@
 # note-refinery-simple
 
-Small Python CLI for LLM-based note cleanup.
+Small Python CLI for turning lecture source files into cleaned markdown notes.
+
+Supported input source types:
+
+- `.md`
+- `.py`
+- `.ipynb`
 
 Pipeline:
 
@@ -106,6 +112,13 @@ Pipeline stages:
    - writes `SYNTHESIS.md` and `concept_map.json`
 5. `run`
    - runs `review -> patch -> verify -> synthesize`
+
+Input contract:
+
+- one lecture set may contain `.md`, `.py`, and `.ipynb` source files
+- outputs stay markdown-only under `patched_notes/`
+- v1 image enrichment stays scoped to original `.md` files only
+- if root contains source files and child folders with source files also exist, run fails fast instead of guessing single-folder or batch mode
 
 Outputs:
 
@@ -255,7 +268,7 @@ py -3 -m note_refinery_simple run --notes-dir "C:\Users\HOANG PHI LONG DANG\Mine
 
 Fast rerun with cached artifacts:
 
-`--reuse-image-context-from` can point at full or partial `reports/image_context.json`. Missing images are enriched live, then merged back into canonical cache file for current run.
+`--reuse-image-context-from` can point at full or partial `reports/image_context.json`. Missing images are enriched live, then merged back into canonical cache file for current run. In v1 this cache applies to original `.md` image references only.
 
 
 ```powershell
@@ -268,6 +281,8 @@ Stage notes:
 
 - `review` on one note folder creates `reports/REVIEW.md` and canonical `reports/image_context.json`
 - `review` on a folder of note folders writes `batch_manifest.json` plus one subtree per folder under `output-root/<folder>/reports/`
+- source discovery supports `.md`, `.py`, and `.ipynb`
+- if root source files and child source folders are both present, the run fails fast with a mixed-layout error
 - `patch` on one note folder expects `reports/REVIEW.md` to already exist
 - `patch` on batch root reads `batch_manifest.json` and patches every listed folder into `output-root/<folder>/patched_notes/`
 - `verify` on one note folder expects patched notes in `patched_notes/` and checks them against `REVIEW.md`
@@ -276,6 +291,7 @@ Stage notes:
 - `synthesize` on batch root reads all manifest-listed patched folders together, then writes one root `reports/SYNTHESIS.md` and `reports/concept_map.json`
 - `run` works for both one note folder and folder batch
 - batch means full discovered folder set for one review run, not review worker chunking
+- image enrichment and `image_context.json` stay scoped to original `.md` sources in v1
 
 ## Setup
 
