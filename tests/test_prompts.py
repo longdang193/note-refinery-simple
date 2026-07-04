@@ -32,6 +32,28 @@ class PromptLoadingTest(unittest.TestCase):
             self.assertIn("derive one explicit step-by-step mapping from source code", prompt_set.patch_prompt)
             self.assertIn("leave bookkeeping or indexing findings unresolved", prompt_set.verify_prompt)
 
+    def test_loaded_prompt_profiles_require_explicit_labels_for_original_vs_corrected_code(self) -> None:
+        for profile in ("default", "strict"):
+            prompt_set = load_prompt_set(
+                project_root=Path(r"C:\Users\HOANG PHI LONG DANG\repos\note-refinery-simple"),
+                prompt_root_dir=Path("prompts"),
+                prompt_profile=profile,
+            )
+
+            self.assertIn("label them explicitly as original code versus corrected code", prompt_set.patch_prompt)
+            self.assertIn("mixes original and corrected code semantics in one example", prompt_set.verify_prompt)
+
+    def test_loaded_prompt_profiles_require_concrete_numeric_bookkeeping_example(self) -> None:
+        for profile in ("default", "strict"):
+            prompt_set = load_prompt_set(
+                project_root=Path(r"C:\Users\HOANG PHI LONG DANG\repos\note-refinery-simple"),
+                prompt_root_dir=Path("prompts"),
+                prompt_profile=profile,
+            )
+
+            self.assertIn("one concrete numeric example", prompt_set.patch_prompt)
+            self.assertIn("one concrete numeric example", prompt_set.verify_prompt)
+
     def test_load_prompt_set_reads_markdown_prompt_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

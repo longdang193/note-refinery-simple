@@ -914,6 +914,42 @@ def act(state: dict) -> bool:
 
         self.assertIn("leave bookkeeping or indexing findings unresolved", prompt)
 
+    def test_patch_prompt_requires_variant_labels_when_original_and_corrected_code_both_appear(self) -> None:
+        prompt = build_patch_prompt(
+            notes={"env.py.md": "# Environment\n\nstep variants.\n"},
+            review_markdown="# Review\n\n- Clarify original versus safer step semantics.",
+            patch_mode="clean-teaching",
+        )
+
+        self.assertIn("label them explicitly as original code versus corrected code", prompt)
+
+    def test_verify_prompt_rejects_mixed_original_and_corrected_code_semantics(self) -> None:
+        prompt = build_verify_prompt(
+            original_notes={"env.py.md": "# Original\n\nstep note.\n"},
+            patched_notes={"env.py.md": "# Patched\n\nstep note.\n"},
+            review_markdown="# Review\n\n- Clarify original versus safer step semantics.",
+        )
+
+        self.assertIn("mixes original and corrected code semantics in one example", prompt)
+
+    def test_patch_prompt_requires_concrete_numeric_mapping_for_bookkeeping(self) -> None:
+        prompt = build_patch_prompt(
+            notes={"mc.py.md": "# MC\n\nPDS note.\n"},
+            review_markdown="# Review\n\n- Reconcile PDS indexing and reward alignment.",
+            patch_mode="clean-teaching",
+        )
+
+        self.assertIn("one concrete numeric example", prompt)
+
+    def test_verify_prompt_requires_concrete_numeric_mapping_for_bookkeeping(self) -> None:
+        prompt = build_verify_prompt(
+            original_notes={"mc.py.md": "# Original\n\nPDS note.\n"},
+            patched_notes={"mc.py.md": "# Patched\n\nPDS note.\n"},
+            review_markdown="# Review\n\n- Reconcile PDS indexing and reward alignment.",
+        )
+
+        self.assertIn("one concrete numeric example", prompt)
+
     def test_parse_patch_payload_accepts_fenced_json_with_trailing_text(self) -> None:
         payload = parse_patch_payload(
             "```json\n{\"files\":{\"full.md\":\"# Topic\\n\\nClean note.\"}}\n```\n\nDone.\n"
