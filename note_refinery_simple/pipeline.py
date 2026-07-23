@@ -202,7 +202,7 @@ class ReviewPipeline:
         paths.ensure()
         notes = read_notes(notes_dir)
         if progress_callback is not None:
-            progress_callback(f"review: loaded {len(notes)} markdown file(s)")
+            progress_callback(f"review: loaded {len(notes)} source file(s)")
         if cached_image_contexts is None:
             image_contexts = build_image_contexts(
                 notes_dir=notes_dir,
@@ -268,7 +268,7 @@ class ReviewPipeline:
         notes = read_notes(notes_dir)
         if selected_note_names is not None:
             notes = {name: content for name, content in notes.items() if name in selected_note_names}
-        self._report_progress(f"patch: loaded {len(notes)} markdown file(s)")
+        self._report_progress(f"patch: loaded {len(notes)} source file(s)")
         if not notes:
             return
         review_markdown = (paths.reports_dir / "REVIEW.md").read_text(encoding="utf-8")

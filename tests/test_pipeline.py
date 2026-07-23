@@ -340,8 +340,8 @@ class ReviewPipelineTest(unittest.TestCase):
 
             pipeline.run(notes_dir=notes_dir, paths=paths)
 
-            self.assertIn("review: loaded 1 markdown file(s)", messages)
-            self.assertIn("patch: loaded 1 markdown file(s)", messages)
+            self.assertIn("review: loaded 1 source file(s)", messages)
+            self.assertIn("patch: loaded 1 source file(s)", messages)
             self.assertIn("patch: file 1/1 [queueing.md]", messages)
             self.assertIn("patch: wrote 1 patched file(s)", messages)
             self.assertIn("verify: done", messages)
